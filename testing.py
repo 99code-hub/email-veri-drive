@@ -18,7 +18,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-
 LOGIN_URL = "https://docs.google.com/document"
 CREDENTIALS_FILE = "credentials.txt"
 RESULTS_FILE = "login_test_results.csv"
@@ -53,7 +52,6 @@ global_email_index = 0
 
 
 def load_config_and_emails():
-    """Load config (add_user batch size) and all emails from add_user.txt once at startup."""
     global add_user_batch_size, all_add_users
 
     add_user_batch_size = 0
@@ -242,11 +240,6 @@ def process_email_file_in_batches(driver, input_path, limit):
 
 
 def click_save_in_windows_dialog(filename_hint=None, timeout=12):
-    """
-    Wait for a Windows Save/Open download dialog and click the Save button.
-    filename_hint: optional substring to help detect dialogs (e.g. ".json").
-    Returns True if Save was clicked, False on timeout.
-    """
     if "Desktop" not in globals() or Desktop is None:
         return False
 
@@ -319,7 +312,6 @@ def load_credentials(path):
 
 
 def click_next_button(driver):
-    """Find and click a 'Next'/'Continue'/'Sign in' style button by visible text."""
     for text in NEXT_BUTTON_TEXTS:
         xpath = (
             f"//button[contains(normalize-space(.), '{text}')] | "
@@ -362,7 +354,6 @@ def wait_for_visible_input(driver, input_type, manual_selector=None, timeout=30)
 
 
 def check_outcome(driver):
-    """Returns 'SUCCESS', 'FAILED', or 'UNKNOWN'."""
     end_time = time.time() + WAIT_SECONDS
     while time.time() < end_time:
         try:
@@ -613,16 +604,32 @@ def attempt_login(driver, email, password):
 
         time.sleep(25)
 
+        share_xpaths = [
+            "//div[@role='button' and @aria-label='Share. Private to only me. ']",
+            "//div[@role='button' and contains(@aria-label,'Share') and contains(@class,'docs-titlebar-button')]",
+            "//span[@id='docs-titlebar-share-client-button']//div[@role='button' and contains(@aria-label,'Share')]",
+            "//span[contains(@class,'apps-share-sprite')]/ancestor::div[@role='button' and contains(@aria-label,'Share')]",
+            "//div[contains(@class,'docs-titlebar-button') and contains(@aria-label,'Share')]"
+        ]
+
+        share_btn = None
+        for xp in share_xpaths:
+            try:
+                share_btn = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                print(f"  Found Share button using: {xp}")
+                break
+            except Exception:
+                continue
+
+        if share_btn is None:
+            raise RuntimeError("Share button not found")
+
         try:
-            share_btn = WebDriverWait(driver, 20).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//div[@role='button' and contains(@class,'docs-titlebar-button') and contains(@aria-label, 'Share.')]")
-                )
-            )
             driver.execute_script("arguments[0].click();", share_btn)
-            print("  Clicked Share button.")
+            print("  Clicked Share button via JS.")
         except Exception:
-            print("  Share button not found; continuing.")
+            share_btn.click()
+            print("  Clicked Share button via direct click.")
 
         time.sleep(10)
 
