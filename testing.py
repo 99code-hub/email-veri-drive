@@ -175,6 +175,27 @@ def parse_email_lines(lines):
     return valid, errors
 
 
+def find_share_people_input(driver, timeout=15):
+    selectors = [
+        (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.XPATH, "//input[@jsname='YPqjbf']"),
+        (By.XPATH, "//div[@jsname='w1sQPc']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
+        (By.XPATH, "//input[contains(@aria-label, 'Add people') and contains(@aria-label, 'calendar events')]"),
+    ]
+
+    for by, selector in selectors:
+        try:
+            el = WebDriverWait(driver, timeout).until(
+                EC.visibility_of_element_located((by, selector))
+            )
+            return el
+        except Exception:
+            continue
+    return None
+
+
 def process_email_file_in_batches(driver, input_path, limit):
     try:
         with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -194,19 +215,25 @@ def process_email_file_in_batches(driver, input_path, limit):
         batch = lines[batch_index:batch_index + limit]
         print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
 
+        email_input = find_share_people_input(driver, timeout=15)
+        if email_input is None:
+            print("  Share dialog email input not found after clicking Share.")
+            return
+
         try:
-            email_input = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR,
-                     "input[aria-label*='People'], input[aria-label*='Email'], textarea[aria-label*='People'], input[placeholder*='Add people'], input[placeholder*='Email']")
-                )
-            )
+            driver.execute_script("arguments[0].focus(); arguments[0].scrollIntoView({block:'center'});", email_input)
             email_input.clear()
             email_input.send_keys("\n".join(batch))
-            print("  Pasted batch into share email box.")
+            print("  Pasted batch into Google Docs share email field.")
         except Exception:
-            print("  Could not find email input; skipping batch.")
-            continue
+            try:
+                email_input.send_keys(Keys.CONTROL, "a")
+                email_input.send_keys(Keys.DELETE)
+                email_input.send_keys("\n".join(batch))
+                print("  Pasted batch via fallback keystroke method.")
+            except Exception:
+                print("  Could not paste into share email field; skipping batch.")
+                continue
 
         time.sleep(30)
 
