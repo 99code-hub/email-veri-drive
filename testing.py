@@ -379,26 +379,24 @@ def check_outcome(driver):
 
 
 def find_share_button(driver, timeout=20):
-    share_xpaths = [
-        "//*[@id='docs-titlebar-share-client-button']//*[self::div or self::button or self::span][@role='button' and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'share') and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'private to only me')]",
-        "//div[@role='button' and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'share') and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'private to only me')]",
-        "//button[@role='button' and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'share') and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'private to only me')]",
-        "//div[contains(@class, 'docs-titlebar-button') and @role='button' and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'share')]",
+    exact_selectors = [
+        (By.XPATH, "//div[@role='button' and @aria-label='Share. Private to only me. ']"),
+        (By.CSS_SELECTOR, "#docs-titlebar-share-client-button div[role='button'][aria-label='Share. Private to only me. ']"),
+        (By.XPATH, "//div[@role='button' and contains(@aria-label, 'Share') and contains(@aria-label, 'Private to only me')]"),
+        (By.XPATH, "//div[contains(@class, 'docs-titlebar-button') and @role='button' and contains(@aria-label, 'Share') and contains(@aria-label, 'Private to only me')]"),
     ]
 
-    for xpath in share_xpaths:
+    for by, selector in exact_selectors:
         try:
-            el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, xpath)))
-            return el
+            return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, selector)))
         except Exception:
             continue
 
-    # final fallback: search all share buttons by label text, then filter by 'private to only me'
     try:
-        buttons = driver.find_elements(By.XPATH, "//*[@role='button' and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'share')]")
+        buttons = driver.find_elements(By.XPATH, "//*[@role='button' and contains(@aria-label, 'Share')]")
         for btn in buttons:
-            label = (btn.get_attribute("aria-label") or "").lower()
-            if "share" in label and "private to only me" in label:
+            label = (btn.get_attribute("aria-label") or "").strip()
+            if "share" in label.lower() and "private to only me" in label.lower():
                 return btn
     except Exception:
         pass
@@ -634,27 +632,16 @@ def attempt_login(driver, email, password):
 
         try:
             share_btn = find_share_button(driver, timeout=20)
-            if share_btn is not None:
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", share_btn)
-                WebDriverWait(driver, 10).until(EC.element_to_be_clickable(share_btn))
-                driver.execute_script("arguments[0].click();", share_btn)
-                print("  Clicked Share button via robust selector.")
-            else:
-                print("  Share button still not found.")
+            if share_btn is None:
                 raise RuntimeError("Share button not found")
+
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", share_btn)
+            WebDriverWait(driver, 10).until(EC.element_to_be_clickable(share_btn))
+            driver.execute_script("arguments[0].click();", share_btn)
+            print("  Clicked Share button via exact target selector.")
         except Exception:
-            try:
-                share_btn = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable(
-                        (By.XPATH, "//div[@role='button' and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'share') and contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'private to only me')]")
-                    )
-                )
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", share_btn)
-                driver.execute_script("arguments[0].click();", share_btn)
-                print("  Clicked Share button via fallback translated aria-label selector.")
-            except Exception:
-                print("  Share button still not found.")
-                raise
+            print("  Share button still not found.")
+            raise
 
         time.sleep(10)
 
