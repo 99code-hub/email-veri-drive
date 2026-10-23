@@ -196,6 +196,40 @@ def find_share_people_input(driver, timeout=15):
     return None
 
 
+def paste_emails_into_share_input(driver, emails):
+    input_field = find_share_people_input(driver, timeout=15)
+    if input_field is None:
+        print("  Share dialog email input not found after clicking Share.")
+        return False
+
+    try:
+        driver.execute_script("""
+            arguments[0].focus();
+            arguments[0].scrollIntoView({block:'center', inline:'center'});
+        """, input_field)
+
+        email_text = "\n".join(emails)
+        driver.execute_script("""
+            arguments[0].value = arguments[1];
+            arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+            arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+        """, input_field, email_text)
+
+        time.sleep(1)
+
+        try:
+            input_field.send_keys(Keys.TAB)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+        print("  Pasted batch into Google Docs share combobox via JS value injection.")
+        return True
+    except Exception as e:
+        print(f"  Failed to paste into Google Docs share combobox: {e}")
+        return False
+
+
 def process_email_file_in_batches(driver, input_path, limit):
     try:
         with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -215,25 +249,9 @@ def process_email_file_in_batches(driver, input_path, limit):
         batch = lines[batch_index:batch_index + limit]
         print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
 
-        email_input = find_share_people_input(driver, timeout=15)
-        if email_input is None:
-            print("  Share dialog email input not found after clicking Share.")
-            return
-
-        try:
-            driver.execute_script("arguments[0].focus(); arguments[0].scrollIntoView({block:'center'});", email_input)
-            email_input.clear()
-            email_input.send_keys("\n".join(batch))
-            print("  Pasted batch into Google Docs share email field.")
-        except Exception:
-            try:
-                email_input.send_keys(Keys.CONTROL, "a")
-                email_input.send_keys(Keys.DELETE)
-                email_input.send_keys("\n".join(batch))
-                print("  Pasted batch via fallback keystroke method.")
-            except Exception:
-                print("  Could not paste into share email field; skipping batch.")
-                continue
+        if not paste_emails_into_share_input(driver, batch):
+            print("  Could not paste this batch into the share field; skipping batch.")
+            continue
 
         time.sleep(30)
 
@@ -406,8 +424,6 @@ def check_outcome(driver):
 
 
 def click_google_docs_share_button(driver):
-    xpath = "//*[@id='docs-titlebar-share-client-button']//div[@role='button' and @aria-label='Share. Private to only me. ' and not(@aria-disabled='true')]"
-
     for attempt in range(12):
         try:
             result = driver.execute_script("""
