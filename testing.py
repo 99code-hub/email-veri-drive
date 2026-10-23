@@ -175,29 +175,41 @@ def parse_email_lines(lines):
     return valid, errors
 
 
-def find_share_people_input(driver, timeout=15):
+def find_share_people_input(driver, timeout=25):
+    """Find the Google Docs share recipient input in the actual DOM used by current Google Docs."""
     selectors = [
-        (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.XPATH, "//input[@jsname='YPqjbf']"),
-        (By.XPATH, "//div[@jsname='w1sQPc']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
+        # very specific modern Google Docs selectors
+        (By.CSS_SELECTOR, "input[role='combobox'][jsname='YPqjbf']"),
         (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
-        (By.XPATH, "//input[contains(@aria-label, 'Add people') and contains(@aria-label, 'calendar events')]"),
+        (By.CSS_SELECTOR, "input.zeumMd.d2j1H[role='combobox']"),
+        (By.ID, "_c23"),
+        (By.XPATH, "//input[@jsname='YPqjbf']"),
+        (By.XPATH, "//input[@role='combobox' and @aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.XPATH, "//input[contains(@aria-label, 'Add people') or contains(@aria-label, 'Invite') or contains(@aria-label, 'people')]"),
+        (By.XPATH, "//div[@role='dialog']//input[@type='text']"),
+        (By.XPATH, "//div[@jsname='w1sQPc']//input"),
+        (By.XPATH, "//input[contains(@placeholder, 'Add people') or contains(@placeholder, 'Email') or contains(@placeholder, 'Invite')]"),
     ]
 
-    for by, selector in selectors:
-        try:
-            el = WebDriverWait(driver, timeout).until(
-                EC.visibility_of_element_located((by, selector))
-            )
-            return el
-        except Exception:
-            continue
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        for by, selector in selectors:
+            try:
+                els = driver.find_elements(by, selector)
+                for el in els:
+                    try:
+                        if el.is_displayed() and el.is_enabled():
+                            return el
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        time.sleep(0.5)
     return None
 
 
 def paste_emails_into_share_input(driver, emails):
-    input_field = find_share_people_input(driver, timeout=15)
+    input_field = find_share_people_input(driver, timeout=25)
     if input_field is None:
         print("  Share dialog email input not found after clicking Share.")
         return False
@@ -216,22 +228,34 @@ def paste_emails_into_share_input(driver, emails):
             if not email:
                 continue
 
-            driver.execute_script("""
-                arguments[0].value = arguments[1];
-                arguments[0].dispatchEvent(new InputEvent('input', {
-                    bubbles: true,
-                    inputType: 'insertText',
-                    data: arguments[1]
-                }));
-                arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-            """, input_field, email)
-
-            time.sleep(0.2)
             try:
+                input_field.clear()
+            except Exception:
+                pass
+
+            try:
+                input_field.send_keys(email)
+                time.sleep(0.2)
                 input_field.send_keys(Keys.ENTER)
                 time.sleep(0.5)
             except Exception:
-                pass
+                try:
+                    driver.execute_script("""
+                        arguments[0].value = arguments[1];
+                        arguments[0].dispatchEvent(new InputEvent('input', {
+                            bubbles: true,
+                            inputType: 'insertText',
+                            data: arguments[1]
+                        }));
+                        arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+                    """, input_field, email)
+                    time.sleep(0.2)
+                    try:
+                        input_field.send_keys(Keys.ENTER)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
         print(f"  Added {len([e for e in emails if str(e).strip()])} recipients to Google Docs share combobox.")
         return True
@@ -434,53 +458,35 @@ def check_outcome(driver):
 
 
 def click_google_docs_share_button(driver):
+    """Click the Google Docs share button in a way that tolerates current DOM changes."""
+    candidates = [
+        (By.ID, "docs-titlebar-share-client-button"),
+        (By.XPATH, "//button[contains(@aria-label, 'Share') or contains(@title, 'Share')]"),
+        (By.XPATH, "//div[contains(@aria-label, 'Share') or contains(@title, 'Share')][@role='button']"),
+        (By.CSS_SELECTOR, "div[role='button'][aria-label*='Share' i]"),
+        (By.CSS_SELECTOR, "button[aria-label*='Share' i]"),
+    ]
+
     for attempt in range(12):
-        try:
-            result = driver.execute_script("""
-            const wrapper = document.querySelector('#docs-titlebar-share-client-button');
-            if (!wrapper) return {ok: false, reason: 'wrapper_not_found'};
-
-            const btn = wrapper.querySelector('div[role="button"][aria-label="Share. Private to only me. "]');
-            if (!btn) return {ok: false, reason: 'button_not_found'};
-
-            const rect = btn.getBoundingClientRect();
-            if (!rect.width || !rect.height) return {ok: false, reason: 'not_visible'};
-
-            const style = window.getComputedStyle(btn);
-            if (style.pointerEvents === 'none' || style.display === 'none' || style.visibility === 'hidden') {
-                return {ok: false, reason: 'blocked_by_css'};
-            }
-
-            btn.scrollIntoView({block: 'center', inline: 'center'});
-            btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
-            btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-            btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-
-            return {ok: true, reason: 'clicked'};
-            """)
-            print(f"  Share button live DOM click attempt {attempt + 1}: {result}")
-
-            time.sleep(1)
-
-            share_modal = driver.execute_script("""
-            const candidates = [
-                '[role="dialog"]',
-                '[aria-label*="Share"]',
-                '[aria-label*="People"]',
-                '[aria-label*="Invite"]'
-            ];
-            for (const sel of candidates) {
-                if (document.querySelector(sel)) return true;
-            }
-            return false;
-            """)
-            if share_modal:
-                print("  Share modal/dialog opened.")
-                return True
-
-        except Exception as e:
-            print(f"  Share button JS click attempt {attempt + 1} failed: {e}")
-
+        for by, selector in candidates:
+            try:
+                buttons = driver.find_elements(by, selector)
+                for btn in buttons:
+                    try:
+                        if btn.is_displayed() and btn.is_enabled():
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", btn)
+                            time.sleep(1.2)
+                            try:
+                                dialog = driver.find_element(By.XPATH, "//div[@role='dialog' or @aria-label='Share']")
+                                if dialog.is_displayed():
+                                    return True
+                            except Exception:
+                                pass
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         time.sleep(1)
 
     print("  Share button still not clickable from the live DOM.")
