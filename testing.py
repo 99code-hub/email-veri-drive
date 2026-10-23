@@ -378,30 +378,52 @@ def check_outcome(driver):
     return "UNKNOWN"
 
 
-def find_share_button(driver, timeout=20):
-    exact_selectors = [
-        (By.XPATH, "//div[@role='button' and @aria-label='Share. Private to only me. ']"),
-        (By.CSS_SELECTOR, "#docs-titlebar-share-client-button div[role='button'][aria-label='Share. Private to only me. ']"),
-        (By.XPATH, "//div[@role='button' and contains(@aria-label, 'Share') and contains(@aria-label, 'Private to only me')]"),
-        (By.XPATH, "//div[contains(@class, 'docs-titlebar-button') and @role='button' and contains(@aria-label, 'Share') and contains(@aria-label, 'Private to only me')]"),
-    ]
+def click_google_docs_share_button(driver, timeout=25):
+    exact_xpath = "//*[@id='docs-titlebar-share-client-button']//div[@role='button' and @aria-label='Share. Private to only me. ' and not(@aria-disabled='true')]"
 
-    for by, selector in exact_selectors:
-        try:
-            return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, selector)))
-        except Exception:
-            continue
+    # strong exact selector first
+    try:
+        share_btn = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, exact_xpath)))
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", share_btn)
+        WebDriverWait(driver, 10).until(EC.visibility_of(share_btn))
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(share_btn))
+        driver.execute_script("arguments[0].click();", share_btn)
+        print("  Clicked Share button using exact DOM selector.")
+        return True
+    except Exception:
+        pass
 
+    # fallback: direct wrapper + inner button
+    try:
+        wrapper = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.ID, "docs-titlebar-share-client-button")))
+        inner = wrapper.find_element(By.XPATH, ".//div[@role='button' and @aria-label='Share. Private to only me. ']")
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inner)
+        WebDriverWait(driver, 10).until(EC.visibility_of(inner))
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(inner))
+        driver.execute_script("arguments[0].click();", inner)
+        print("  Clicked Share button via wrapper + inner button fallback.")
+        return True
+    except Exception:
+        pass
+
+    # fallback: generic share button with label text filter
     try:
         buttons = driver.find_elements(By.XPATH, "//*[@role='button' and contains(@aria-label, 'Share')]")
         for btn in buttons:
             label = (btn.get_attribute("aria-label") or "").strip()
             if "share" in label.lower() and "private to only me" in label.lower():
-                return btn
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                WebDriverWait(driver, 10).until(EC.visibility_of(btn))
+                WebDriverWait(driver, 10).until(EC.element_to_be_clickable(btn))
+                driver.execute_script("arguments[0].click();", btn)
+                print("  Clicked Share button via label filter fallback.")
+                return True
     except Exception:
         pass
 
-    return None
+    print("  Share button not found or not clickable.")
+    return False
 
 
 def attempt_login(driver, email, password):
@@ -631,16 +653,9 @@ def attempt_login(driver, email, password):
         time.sleep(25)
 
         try:
-            share_btn = find_share_button(driver, timeout=20)
-            if share_btn is None:
-                raise RuntimeError("Share button not found")
-
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", share_btn)
-            WebDriverWait(driver, 10).until(EC.element_to_be_clickable(share_btn))
-            driver.execute_script("arguments[0].click();", share_btn)
-            print("  Clicked Share button via exact target selector.")
-        except Exception:
-            print("  Share button still not found.")
+            click_google_docs_share_button(driver)
+        except Exception as e:
+            print(f"  Share button click wrapper raised exception: {e}")
             raise
 
         time.sleep(10)
