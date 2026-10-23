@@ -205,28 +205,38 @@ def paste_emails_into_share_input(driver, emails):
     try:
         driver.execute_script("""
             arguments[0].focus();
-            arguments[0].scrollIntoView({block:'center', inline:'center'});
+            arguments[0].scrollIntoView({block: 'center', inline: 'center'});
+            arguments[0].click();
         """, input_field)
 
-        email_text = "\n".join(emails)
-        driver.execute_script("""
-            arguments[0].value = arguments[1];
-            arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
-            arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-        """, input_field, email_text)
+        time.sleep(0.6)
 
-        time.sleep(1)
+        for email in emails:
+            email = str(email).strip()
+            if not email:
+                continue
 
-        try:
-            input_field.send_keys(Keys.TAB)
-            time.sleep(0.5)
-        except Exception:
-            pass
+            driver.execute_script("""
+                arguments[0].value = arguments[1];
+                arguments[0].dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: arguments[1]
+                }));
+                arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+            """, input_field, email)
 
-        print("  Pasted batch into Google Docs share combobox via JS value injection.")
+            time.sleep(0.2)
+            try:
+                input_field.send_keys(Keys.ENTER)
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+        print(f"  Added {len([e for e in emails if str(e).strip()])} recipients to Google Docs share combobox.")
         return True
     except Exception as e:
-        print(f"  Failed to paste into Google Docs share combobox: {e}")
+        print(f"  Failed to add recipients to Google Docs share combobox: {e}")
         return False
 
 
