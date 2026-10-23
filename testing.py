@@ -23,11 +23,11 @@ WAIT_SECONDS = 10
 DELAY_BETWEEN_ATTEMPTS = 2
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-TEXT_FILE_PATH = SCRIPT_DIR / "Text File.txt"
-INPUT_FALLBACK_PATH = SCRIPT_DIR / "input.txt"
-CONF_PATH = SCRIPT_DIR / "conf"
-VALID_OUTPUT_PATH = SCRIPT_DIR / "valid.txt"
-ERROR_OUTPUT_PATH = SCRIPT_DIR / "error.txt"
+TEXT_FILE_PATH =  "Text File.txt"
+INPUT_FALLBACK_PATH =  "input.txt"
+CONF_PATH =  "conf"
+VALID_OUTPUT_PATH =  "valid.txt"
+ERROR_OUTPUT_PATH =  "error.txt"
 
 
 def get_email_input_path():
