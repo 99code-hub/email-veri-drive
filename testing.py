@@ -604,32 +604,34 @@ def attempt_login(driver, email, password):
 
         time.sleep(25)
 
-        share_xpaths = [
-            "//div[@role='button' and @aria-label='Share. Private to only me. ']",
-            "//div[@role='button' and contains(@aria-label,'Share') and contains(@class,'docs-titlebar-button')]",
-            "//span[@id='docs-titlebar-share-client-button']//div[@role='button' and contains(@aria-label,'Share')]",
-            "//span[contains(@class,'apps-share-sprite')]/ancestor::div[@role='button' and contains(@aria-label,'Share')]",
-            "//div[contains(@class,'docs-titlebar-button') and contains(@aria-label,'Share')]"
-        ]
-
-        share_btn = None
-        for xp in share_xpaths:
-            try:
-                share_btn = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, xp)))
-                print(f"  Found Share button using: {xp}")
-                break
-            except Exception:
-                continue
-
-        if share_btn is None:
-            raise RuntimeError("Share button not found")
-
         try:
-            driver.execute_script("arguments[0].click();", share_btn)
-            print("  Clicked Share button via JS.")
+            share_wrapper = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.ID, "docs-titlebar-share-client-button"))
+            )
+            share_btn = WebDriverWait(share_wrapper, 20).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, ".//div[@role='button' and contains(@aria-label, 'Share.') and contains(@class, 'docs-titlebar-button')]")
+                )
+            )
+            print("  Found Share button inside docs-titlebar-share-client-button.")
+            try:
+                driver.execute_script("arguments[0].click();", share_btn)
+                print("  Clicked Share button via JS.")
+            except Exception:
+                share_btn.click()
+                print("  Clicked Share button via direct click.")
         except Exception:
-            share_btn.click()
-            print("  Clicked Share button via direct click.")
+            try:
+                share_btn = WebDriverWait(driver, 20).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//div[@role='button' and contains(@aria-label, 'Share.') and contains(@class, 'docs-titlebar-button')]")
+                    )
+                )
+                driver.execute_script("arguments[0].click();", share_btn)
+                print("  Clicked Share button via fallback XPath.")
+            except Exception:
+                print("  Share button still not found.")
+                raise
 
         time.sleep(10)
 
