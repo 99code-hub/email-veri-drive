@@ -611,7 +611,7 @@ def attempt_login(driver, email, password):
         except Exception:
             print("  Resume template image not found; continuing.")
 
-        time.sleep(5)
+        time.sleep(25)
 
         try:
             share_btn = WebDriverWait(driver, 20).until(
@@ -624,7 +624,7 @@ def attempt_login(driver, email, password):
         except Exception:
             print("  Share button not found; continuing.")
 
-        time.sleep(3)
+        time.sleep(10)
 
         limit = read_limit_from_conf()
         input_path = get_email_input_path()
