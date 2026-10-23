@@ -175,69 +175,37 @@ def parse_email_lines(lines):
     return valid, errors
 
 
-def click_google_docs_share_button(driver):
-    for attempt in range(20):
-        try:
-            share_btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//div[@role='button' and contains(@aria-label, 'Share') and contains(@aria-label, 'Private to only me')]")
-                )
-            )
-            driver.execute_script("arguments[0].click();", share_btn)
-            print(f"  Clicked share button (attempt {attempt + 1}).")
-            time.sleep(1)
-
-            share_open = driver.execute_script("""
-            const selectors = [
-                '[role="dialog"]',
-                '[aria-label*="Share"]',
-                '[aria-label*="Add people"]',
-                'input[role="combobox"][aria-label*="Add people"]'
-            ];
-            for (const sel of selectors) {
-                if (document.querySelector(sel)) return true;
-            }
-            return false;
-            """)
-            if share_open:
-                return True
-        except Exception as e:
-            print(f"  Share button click attempt {attempt + 1} failed: {e}")
-
-        time.sleep(1)
-
-    print("  Share button still not clickable. Final share dialog not detected.")
-    return False
-
-
-def find_share_people_input(driver, timeout=20):
+def find_share_people_input(driver, timeout=15):
     selectors = [
-        (By.XPATH, "//input[@role='combobox' and @aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.XPATH, "//input[@id='_c23' or @jsname='YPqjbf']"),
         (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.XPATH, "//input[@role='combobox' and contains(@aria-label, 'Add people')]"),
-        (By.CSS_SELECTOR, "input[role='combobox'][aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.XPATH, "//input[@jsname='YPqjbf']"),
+        (By.XPATH, "//div[@jsname='w1sQPc']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
+        (By.XPATH, "//input[contains(@aria-label, 'Add people') and contains(@aria-label, 'calendar events')]"),
     ]
+
     for by, selector in selectors:
         try:
-            return WebDriverWait(driver, timeout).until(
+            el = WebDriverWait(driver, timeout).until(
                 EC.visibility_of_element_located((by, selector))
             )
+            return el
         except Exception:
-            pass
+            continue
     return None
 
 
 def paste_emails_into_share_input(driver, emails):
-    input_field = find_share_people_input(driver, timeout=20)
+    input_field = find_share_people_input(driver, timeout=15)
     if input_field is None:
-        print("  Share dialog email input still not found.")
+        print("  Share dialog email input not found after clicking Share.")
         return False
 
     try:
         driver.execute_script("""
-            arguments[0].scrollIntoView({block:'center', inline:'center'});
             arguments[0].focus();
+            arguments[0].scrollIntoView({block:'center', inline:'center'});
         """, input_field)
 
         email_text = "\n".join(emails)
@@ -245,20 +213,20 @@ def paste_emails_into_share_input(driver, emails):
             arguments[0].value = arguments[1];
             arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
             arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-            arguments[0].dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
         """, input_field, email_text)
 
         time.sleep(1)
 
         try:
             input_field.send_keys(Keys.TAB)
+            time.sleep(0.5)
         except Exception:
             pass
 
-        print("  Pasted batch into Google Docs share combobox using JS injection.")
+        print("  Pasted batch into Google Docs share combobox via JS value injection.")
         return True
     except Exception as e:
-        print(f"  Failed to paste emails into share combobox: {e}")
+        print(f"  Failed to paste into Google Docs share combobox: {e}")
         return False
 
 
@@ -283,7 +251,7 @@ def process_email_file_in_batches(driver, input_path, limit):
 
         if not paste_emails_into_share_input(driver, batch):
             print("  Could not paste this batch into the share field; skipping batch.")
-            break
+            continue
 
         time.sleep(30)
 
@@ -453,6 +421,60 @@ def check_outcome(driver):
                 pass
         time.sleep(0.3)
     return "UNKNOWN"
+
+
+def click_google_docs_share_button(driver):
+    for attempt in range(12):
+        try:
+            result = driver.execute_script("""
+            const wrapper = document.querySelector('#docs-titlebar-share-client-button');
+            if (!wrapper) return {ok: false, reason: 'wrapper_not_found'};
+
+            const btn = wrapper.querySelector('div[role="button"][aria-label="Share. Private to only me. "]');
+            if (!btn) return {ok: false, reason: 'button_not_found'};
+
+            const rect = btn.getBoundingClientRect();
+            if (!rect.width || !rect.height) return {ok: false, reason: 'not_visible'};
+
+            const style = window.getComputedStyle(btn);
+            if (style.pointerEvents === 'none' || style.display === 'none' || style.visibility === 'hidden') {
+                return {ok: false, reason: 'blocked_by_css'};
+            }
+
+            btn.scrollIntoView({block: 'center', inline: 'center'});
+            btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+            btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+            btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+
+            return {ok: true, reason: 'clicked'};
+            """)
+            print(f"  Share button live DOM click attempt {attempt + 1}: {result}")
+
+            time.sleep(1)
+
+            share_modal = driver.execute_script("""
+            const candidates = [
+                '[role="dialog"]',
+                '[aria-label*="Share"]',
+                '[aria-label*="People"]',
+                '[aria-label*="Invite"]'
+            ];
+            for (const sel of candidates) {
+                if (document.querySelector(sel)) return true;
+            }
+            return false;
+            """)
+            if share_modal:
+                print("  Share modal/dialog opened.")
+                return True
+
+        except Exception as e:
+            print(f"  Share button JS click attempt {attempt + 1} failed: {e}")
+
+        time.sleep(1)
+
+    print("  Share button still not clickable from the live DOM.")
+    return False
 
 
 def attempt_login(driver, email, password):
@@ -671,7 +693,7 @@ def attempt_login(driver, email, password):
         try:
             template_img = WebDriverWait(driver, 20).until(
                 EC.element_to_be_clickable(
-                    (By.XPATH, "//img[contains(@src, '1wyFqxsRmKm9q--7j4WRmBMn694YdhV6hmNrfh4rVm2E_400.png')]" )
+                    (By.XPATH, "//img[contains(@src, '1wyFqxsRmKm9q--7j4WRmBMn694YdhV6hmNrfh4rVm2E_400.png')]")
                 )
             )
             driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", template_img)
