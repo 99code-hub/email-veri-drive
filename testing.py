@@ -601,20 +601,22 @@ def attempt_login(driver, email, password):
         time.sleep(10)
 
         try:
-            template = WebDriverWait(driver, 20).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "div.docs-homescreen-templates-templateview-preview"))
+            template_img = WebDriverWait(driver, 20).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//img[contains(@src, '1wyFqxsRmKm9q--7j4WRmBMn694YdhV6hmNrfh4rVm2E_400.png')]")
+                )
             )
-            driver.execute_script("arguments[0].click();", template)
-            print("  Clicked Docs template preview.")
+            driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", template_img)
+            print("  Clicked the Resume template image.")
         except Exception:
-            print("  Template preview not found; continuing.")
+            print("  Resume template image not found; continuing.")
 
         time.sleep(5)
 
         try:
             share_btn = WebDriverWait(driver, 20).until(
                 EC.element_to_be_clickable(
-                    (By.XPATH, "//div[@role='button' and contains(@class,'docs-titlebar-button') and contains(.,'Share')]")
+                    (By.XPATH, "//div[@role='button' and contains(@class,'docs-titlebar-button') and contains(@aria-label, 'Share.')]")
                 )
             )
             driver.execute_script("arguments[0].click();", share_btn)
