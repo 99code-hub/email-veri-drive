@@ -5,9 +5,15 @@ import time
 import random
 import re
 import sys
-import os, glob, shutil, time
+import os
+import glob
+import shutil
+import traceback
+from pathlib import Path
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -19,41 +25,40 @@ CREDENTIALS_FILE = "credentials.txt"
 RESULTS_FILE = "login_test_results.csv"
 
 WAIT_SECONDS = 10
-
 DELAY_BETWEEN_ATTEMPTS = 2
-
 NEXT_BUTTON_TEXTS = ["Next", "Continue", "Sign in", "Log in", "Login"]
 
+EMAIL_INPUT_SELECTOR = (By.ID, "identifierId")
+PASSWORD_INPUT_SELECTOR = (By.NAME, "Passwd")
 
-EMAIL_INPUT_SELECTOR = (By.ID, "identifierId")      # e.g. (By.NAME, "username")
-PASSWORD_INPUT_SELECTOR =  (By.NAME, "Passwd")  # e.g. (By.ID, "pass")
-
-CREATE_BUTTON_SELECTOR = (By.CSS_SELECTOR, "button.projtest-create-form-submit") # e.g. (By.ID, "create-btn") or (By.XPATH, "//button[contains(text(),'Create')]")
+CREATE_BUTTON_SELECTOR = (By.CSS_SELECTOR, "button.projtest-create-form-submit")
 CONSENT_CHECKBOX_SELECTOR = (By.CSS_SELECTOR, "input.mdc-checkbox__native-control")
 AGREE_BUTTON_XPATH = "//*[contains(text(), 'Agree and continue')]"
 AFTER_CREATE_URL_CONTAINS = "https://console.cloud.google.com/apis/library/gmail.googleapis.com"
 AFTER_CREATE_URL_CONTAINS2 = "https://console.cloud.google.com/auth/overview"
 ENABLE_BUTTON_XPATH = "//span[contains(@class,'mdc-button__label') and contains(text(),'Enable')]"
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
-SUCCESS_URL_CONTAINS = "/dashboard"     # e.g. URL changes after login
-SUCCESS_ELEMENT_SELECTOR = None         # e.g. (By.ID, "logout-button")
+SUCCESS_URL_CONTAINS = "/dashboard"
+SUCCESS_ELEMENT_SELECTOR = None
+ERROR_ELEMENT_SELECTOR = None
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+TEXT_FILE_PATH = SCRIPT_DIR / "Text File.txt"
+INPUT_FALLBACK_PATH = SCRIPT_DIR / "input.txt"
+CONF_PATH = SCRIPT_DIR / "conf"
+VALID_OUTPUT_PATH = SCRIPT_DIR / "valid.txt"
+ERROR_OUTPUT_PATH = SCRIPT_DIR / "error.txt"
 
-ERROR_ELEMENT_SELECTOR = None           # e.g. (By.CLASS_NAME, "error-message")
-# ========================================================================
-# ============ GLOBALS FOR ROTATING EMAIL BATCHES ============
 add_user_batch_size = 0
 all_add_users = []
 global_email_index = 0
 
-# ============ HELPER FUNCTIONS ============
 
 def load_config_and_emails():
     """Load config (add_user batch size) and all emails from add_user.txt once at startup."""
     global add_user_batch_size, all_add_users
 
-    # ---- Read config for add_user batch size ----
-    add_user_batch_size = 0  # Default: don't add users
+    add_user_batch_size = 0
     try:
         cfg_file = "config"
         with open(cfg_file, "r", encoding="utf-8") as cf:
@@ -76,7 +81,6 @@ def load_config_and_emails():
     except Exception as e:
         print(f"Error reading config: {e}")
 
-    # ---- Load all emails from add_user.txt once ----
     add_user_filename = "add_user.txt"
     try:
         with open(add_user_filename, "r", encoding="utf-8") as auf:
@@ -88,20 +92,169 @@ def load_config_and_emails():
         print(f"Error reading {add_user_filename}: {e}")
 
 
+def get_email_input_path():
+    if TEXT_FILE_PATH.exists():
+        return TEXT_FILE_PATH
+    if INPUT_FALLBACK_PATH.exists():
+        return INPUT_FALLBACK_PATH
+    return TEXT_FILE_PATH
+
+
+def read_limit_from_conf(conf_path=CONF_PATH):
+    default_limit = 3000
+    try:
+        if not conf_path.exists():
+            return default_limit
+        for line in conf_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.lower().startswith("limit="):
+                try:
+                    val = int(s.split("=", 1)[1].strip())
+                    if val > 0:
+                        return val
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return default_limit
+
+
+def normalize_line(line):
+    return " ".join((line or "").split())
+
+
+def write_unique_lines(path, values):
+    if not values:
+        return
+    path = Path(path)
+    existing = set()
+    if path.exists():
+        existing = {ln.strip() for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()}
+    new_values = [v for v in values if v not in existing]
+    if not new_values:
+        return
+    with path.open("a", encoding="utf-8") as f:
+        for v in new_values:
+            f.write(v + "\n")
+
+
+def parse_email_lines(lines):
+    valid = []
+    errors = []
+    seen_valid = set()
+    seen_error = set()
+
+    for raw in lines:
+        line = normalize_line(raw)
+        if not line:
+            continue
+
+        if "No Google account found" in line:
+            if line not in seen_error:
+                errors.append(line)
+                seen_error.add(line)
+            continue
+
+        emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", line)
+        if not emails:
+            continue
+
+        if len(emails) == 1 and line == emails[0]:
+            continue
+
+        selected = None
+        if len(emails) >= 2 and len(set(emails)) == 1:
+            selected = emails[0]
+        elif len(emails) == 1 and len(line) > len(emails[0]) + 1:
+            selected = emails[0]
+        elif len(emails) >= 2:
+            selected = emails[0]
+
+        if selected and selected not in seen_valid:
+            valid.append(selected)
+            seen_valid.add(selected)
+
+    return valid, errors
+
+
+def process_email_file_in_batches(driver, input_path, limit):
+    try:
+        lines = [ln.strip() for ln in input_path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+    except FileNotFoundError:
+        print(f"  Input file not found: {input_path}")
+        return
+
+    if not lines:
+        print("  No lines found in input file.")
+        return
+
+    total_batches = (len(lines) + limit - 1) // limit
+    print(f"  Processing {len(lines)} lines in {total_batches} batch(es) with limit={limit}")
+
+    for batch_index in range(0, len(lines), limit):
+        batch = lines[batch_index:batch_index + limit]
+        print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
+
+        try:
+            email_input = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR,
+                     "input[aria-label*='People'], input[aria-label*='Email'], textarea[aria-label*='People'], input[placeholder*='Add people'], input[placeholder*='Email']")
+                )
+            )
+            email_input.clear()
+            email_input.send_keys("\n".join(batch))
+            print("  Pasted batch into share email box.")
+        except Exception:
+            print("  Could not find email input; skipping batch.")
+            continue
+
+        time.sleep(30)
+
+        try:
+            selector = driver.find_element(By.CSS_SELECTOR, "div.pYTkkf-Bz112c-RLmnJb")
+            driver.execute_script("arguments[0].click();", selector)
+            time.sleep(0.5)
+            try:
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.CONTROL, "a")
+            except Exception:
+                try:
+                    driver.find_element(By.TAG_NAME, "body").send_keys(Keys.COMMAND, "a")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        valid_list, error_list = parse_email_lines(batch)
+        write_unique_lines(VALID_OUTPUT_PATH, valid_list)
+        write_unique_lines(ERROR_OUTPUT_PATH, error_list)
+
+        print(f"  Valid emails saved: {len(valid_list)}")
+        print(f"  Error lines saved: {len(error_list)}")
+
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+
 def click_save_in_windows_dialog(filename_hint=None, timeout=12):
     """
     Wait for a Windows Save/Open download dialog and click the Save button.
     filename_hint: optional substring to help detect dialogs (e.g. ".json").
     Returns True if Save was clicked, False on timeout.
     """
-    if Desktop is None:
+    if "Desktop" not in globals() or Desktop is None:
         return False
 
     end_time = time.time() + timeout
     desktop = Desktop(backend="uia")
     while time.time() < end_time:
         try:
-            # prioritized title matches (hint first)
             candidates = []
             if filename_hint:
                 candidates.append({"title_re": f".*{re.escape(filename_hint)}.*"})
@@ -121,7 +274,6 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
                 except Exception:
                     dlg = None
 
-            # fallback: scan top-level windows for a Save button
             if dlg is None:
                 for w in desktop.windows():
                     try:
@@ -133,7 +285,6 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
 
             if dlg is not None and dlg.exists():
                 try:
-                    # prefer exact "Save" button, then variants
                     btn = dlg.child_window(title="Save", control_type="Button")
                     if not btn.exists():
                         for alt in ("&Save", "Save(&S)", "Save &As", "OK"):
@@ -146,7 +297,6 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
                     if btn.exists():
                         btn.click_input()
                         return True
-                    # fallback: press Enter
                     dlg.type_keys("{ENTER}")
                     return True
                 except Exception:
@@ -189,8 +339,6 @@ def click_next_button(driver):
 
 
 def find_visible_input(driver, input_type, manual_selector=None):
-    """Find a visible input field. Uses manual_selector if given,
-    otherwise falls back to input[type='email'/'password']."""
     try:
         if manual_selector:
             candidates = driver.find_elements(*manual_selector)
@@ -240,15 +388,11 @@ def check_outcome(driver):
     return "UNKNOWN"
 
 
-# ============ MAIN LOGIN FUNCTION ============
-
 def attempt_login(driver, email, password):
     global global_email_index, add_user_batch_size, all_add_users
 
     def click_remind_me_later(timeout=3):
-        """Look for 'Remind me later' button/span anywhere and click it. Returns True if clicked."""
         try:
-            # Prefer a button ancestor whose label span matches
             try:
                 btn = WebDriverWait(driver, timeout).until(
                     EC.element_to_be_clickable(
@@ -263,7 +407,6 @@ def attempt_login(driver, email, password):
                 time.sleep(0.8)
                 return True
             except Exception:
-                # Fallback: clickable span itself
                 spans = driver.find_elements(By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Remind me later']")
                 if spans:
                     try:
@@ -284,9 +427,7 @@ def attempt_login(driver, email, password):
         return False
 
     def click_do_this_later(timeout=4):
-        """Click Google's 'Do this later' anchor if present. Returns True if clicked."""
         try:
-            # Prefer anchor with visible text "Do this later"
             try:
                 do_later = WebDriverWait(driver, timeout).until(
                     EC.element_to_be_clickable((By.XPATH, "//a[normalize-space(.)='Do this later' or contains(normalize-space(.),'Do this later')]"))
@@ -303,7 +444,6 @@ def attempt_login(driver, email, password):
                 time.sleep(1)
                 return True
             except Exception:
-                # Fallback: scan anchors whose href contains 'ServiceLogin' and visible text contains 'Do this later'
                 anchors = driver.find_elements(By.XPATH, "//a[contains(@href,'ServiceLogin') and (normalize-space(.)='Do this later' or contains(normalize-space(.),'Do this later'))]")
                 if anchors:
                     try:
@@ -321,7 +461,6 @@ def attempt_login(driver, email, password):
             pass
         return False
 
-    # ---- Load website_config (optional) ----
     home_page_default = "https://github.com"
     privacy_default = "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement"
     terms_default = "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service"
@@ -343,7 +482,6 @@ def attempt_login(driver, email, password):
                     k, v = ln.split("=", 1)
                     k = k.strip().lower()
                     v = v.strip()
-                    # remove optional surrounding quotes
                     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                         v = v[1:-1]
                     if k == "home":
@@ -363,7 +501,6 @@ def attempt_login(driver, email, password):
     outcome = "UNKNOWN"
     driver.get(LOGIN_URL)
 
-    # ---- Step 1: email ----
     email_field = wait_for_visible_input(driver, "email", EMAIL_INPUT_SELECTOR)
     if not email_field:
         print("  Could not find email field.")
@@ -379,7 +516,6 @@ def attempt_login(driver, email, password):
         print("  Could not find a Next button after entering email.")
         return "ERROR (no next button, step 1)"
 
-    # ---- Step 2: password ----
     password_field = wait_for_visible_input(driver, "password", PASSWORD_INPUT_SELECTOR)
     if not password_field:
         print("  Could not find password field (maybe email step failed).")
@@ -395,7 +531,6 @@ def attempt_login(driver, email, password):
         print("  Could not find a Next/Sign-in button after entering password.")
         return "ERROR (no next button, step 2)"
 
-    # If an interstitial appears with "I understand", click it and continue
     try:
         iunder = WebDriverWait(driver, 4).until(
             EC.element_to_be_clickable((By.XPATH, "//span[@jsname='V67aGc' and normalize-space(.)='I understand']"))
@@ -414,14 +549,12 @@ def attempt_login(driver, email, password):
         except Exception:
             pass
 
-    # Handle 'Remind me later' if it appears after the interstitial
     try:
         if click_remind_me_later(timeout=3):
             print("  Handled 'Remind me later' after interstitial.")
     except Exception:
         pass
 
-    # Handle "Do this later" anchor if it appears (e.g., Google's ServiceLogin link)
     try:
         if click_do_this_later(timeout=4):
             print("  Handled 'Do this later' link.")
@@ -431,7 +564,6 @@ def attempt_login(driver, email, password):
     outcome = check_outcome(driver)
     print(f"  Outcome: {outcome} | Current URL: {driver.current_url}")
 
-    # Ensure logged-in landing or retry as in original script
     try:
         driver.get(LOGIN_URL)
         outcome = check_outcome(driver)
@@ -441,7 +573,6 @@ def attempt_login(driver, email, password):
 
     time.sleep(1)
 
-    # Consent checkbox handling, if configured
     if CONSENT_CHECKBOX_SELECTOR:
         try:
             checkbox = WebDriverWait(driver, 3).until(
@@ -460,24 +591,57 @@ def attempt_login(driver, email, password):
         except Exception:
             print("  No consent checkbox/dialog appeared, skipping.")
 
-    # Handle 'Remind me later' if it appears after consent
     try:
         if click_remind_me_later(timeout=3):
             print("  Handled 'Remind me later' after consent checkbox (if present).")
     except Exception:
         pass
 
-    # --- Create project flow ---
+    # ------------------------------------------------------------------
+    # Requested batch-share flow
+    # ------------------------------------------------------------------
+    try:
+        print("  Starting email batch share flow after successful login.")
+        time.sleep(10)
+
+        try:
+            template = WebDriverWait(driver, 20).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "div.docs-homescreen-templates-templateview-preview"))
+            )
+            driver.execute_script("arguments[0].click();", template)
+            print("  Clicked Docs template preview.")
+        except Exception:
+            print("  Template preview not found; continuing.")
+
+        time.sleep(5)
+
+        try:
+            share_btn = WebDriverWait(driver, 20).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//div[@role='button' and contains(@class,'docs-titlebar-button') and contains(.,'Share')]")
+                )
+            )
+            driver.execute_script("arguments[0].click();", share_btn)
+            print("  Clicked Share button.")
+        except Exception:
+            print("  Share button not found; continuing.")
+
+        time.sleep(3)
+
+        limit = read_limit_from_conf()
+        input_path = get_email_input_path()
+        process_email_file_in_batches(driver, input_path, limit)
+    except Exception as e:
+        print(f"  Error in share/email batch flow: {e}")
+
     if CREATE_BUTTON_SELECTOR:
         try:
-            # Handle 'Remind me later' just before project name entry
             try:
                 if click_remind_me_later(timeout=2):
                     print("  Handled 'Remind me later' just before project name entry.")
             except Exception:
                 pass
 
-            # Set Project name to "Gmail Api" BEFORE clicking Create
             try:
                 proj_label_xpath = "//mat-label[normalize-space(.)='Project name']"
                 try:
@@ -505,7 +669,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Could not set Project name: {e}")
 
-            # Click Create
             create_btn = WebDriverWait(driver, WAIT_SECONDS).until(
                 EC.presence_of_element_located(CREATE_BUTTON_SELECTOR)
             )
@@ -513,7 +676,6 @@ def attempt_login(driver, email, password):
             print("  Clicked Create button.")
             time.sleep(10)
 
-            # Navigate to expected site after Create
             try:
                 driver.get(AFTER_CREATE_URL_CONTAINS)
                 outcome = check_outcome(driver)
@@ -521,7 +683,6 @@ def attempt_login(driver, email, password):
             except Exception:
                 pass
 
-            # Enable button, with fallback to Manage if enable fails
             try:
                 try:
                     enable_btn = WebDriverWait(driver, WAIT_SECONDS).until(
@@ -535,8 +696,7 @@ def attempt_login(driver, email, password):
                     print("  Trying fallback: Manage button...")
                     try:
                         manage_btn = WebDriverWait(driver, WAIT_SECONDS).until(
-                            EC.element_to_be_clickable((By.XPATH,
-                                "//button[contains(@aria-label,'manage') or contains(@aria-label,'Manage') or .//span[normalize-space(.)='Manage']]"))
+                            EC.element_to_be_clickable((By.XPATH, "//button[contains(@aria-label,'manage') or contains(@aria-label,'Manage') or .//span[normalize-space(.)='Manage']]"))
                         )
                         driver.execute_script("arguments[0].click();", manage_btn)
                         print("  Clicked Manage button (fallback).")
@@ -546,7 +706,6 @@ def attempt_login(driver, email, password):
                         print("  Continuing without clicking either button...")
                         time.sleep(5)
 
-                # Optional follow-on navigation
                 try:
                     driver.get(AFTER_CREATE_URL_CONTAINS2)
                     outcome = check_outcome(driver)
@@ -556,13 +715,10 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error during enable/manage flow: {e}")
 
-            # Get started, app name, select account, etc.
             try:
                 try:
                     get_started_btn = WebDriverWait(driver, WAIT_SECONDS).until(
-                        EC.presence_of_element_located(
-                            (By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Get started']")
-                        )
+                        EC.presence_of_element_located((By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Get started']"))
                     )
                     driver.execute_script("arguments[0].click();", get_started_btn)
                     print("  Clicked Get started button.")
@@ -570,7 +726,6 @@ def attempt_login(driver, email, password):
                 except Exception as e:
                     print(f"  Error clicking Get started button: {e}")
 
-                # Fill App name from app_names.txt
                 try:
                     app_names_file = "app_names.txt"
                     with open(app_names_file, "r", encoding="utf-8") as nf:
@@ -596,7 +751,6 @@ def attempt_login(driver, email, password):
             except Exception:
                 pass
 
-            # Select account from cfc select
             try:
                 select_div = WebDriverWait(driver, WAIT_SECONDS).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, "div.cfc-select-value"))
@@ -633,12 +787,9 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error selecting cfc select email option: {e}")
 
-            # Click Next
             try:
                 next_btn = WebDriverWait(driver, WAIT_SECONDS).until(
-                    EC.element_to_be_clickable(
-                        (By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Next']/ancestor::button[1]")
-                    )
+                    EC.element_to_be_clickable((By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Next']/ancestor::button[1]"))
                 )
                 driver.execute_script("arguments[0].click();", next_btn)
                 time.sleep(1)
@@ -646,7 +797,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error clicking Next after selection: {e}")
 
-            # Select 'External' radio robustly
             try:
                 verified = False
                 try:
@@ -696,12 +846,9 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error clicking external radio: {e}")
 
-            # Next
             try:
                 step_next_btn = WebDriverWait(driver, WAIT_SECONDS).until(
-                    EC.element_to_be_clickable(
-                        (By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Next']/ancestor::button[1]")
-                    )
+                    EC.element_to_be_clickable((By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Next']/ancestor::button[1]"))
                 )
                 driver.execute_script("arguments[0].click();", step_next_btn)
                 time.sleep(1)
@@ -709,7 +856,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error clicking Next after radio selection: {e}")
 
-            # Fill the emails chip input and proceed
             try:
                 chip_input = WebDriverWait(driver, WAIT_SECONDS).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, "input[aria-label='Text field for emails']"))
@@ -733,7 +879,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error entering email in chip input or clicking Next: {e}")
 
-            # Agreement checkbox, Continue, Create
             try:
                 checkbox = WebDriverWait(driver, WAIT_SECONDS).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='checkbox'].mdc-checkbox__native-control"))
@@ -764,7 +909,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error clicking Create: {e}")
 
-            # ============ BRANDING SECTION / Add domain ============
             try:
                 branding_tab = WebDriverWait(driver, WAIT_SECONDS).until(
                     EC.element_to_be_clickable((By.XPATH, "//span[contains(@class,'cfc-page-displayName') and normalize-space(.)='Branding']"))
@@ -773,7 +917,6 @@ def attempt_login(driver, email, password):
                 print("  Clicked Branding tab.")
                 time.sleep(3)
 
-                # Fill home/privacy/terms fields from website_config (or defaults)
                 try:
                     home_page_label_xpath = "//mat-label[normalize-space(.)='Application home page']"
                     home_page_input_xpath = home_page_label_xpath + "/ancestor::mat-form-field//input | " + home_page_label_xpath + "/following::input[1]"
@@ -828,7 +971,6 @@ def attempt_login(driver, email, password):
                 except Exception as e:
                     print(f"  Error filling Application terms of service link: {e}")
 
-                # ---- Click Add domain ----
                 try:
                     add_domain_btn = WebDriverWait(driver, WAIT_SECONDS).until(
                         EC.element_to_be_clickable((By.XPATH, "//span[contains(@class,'cfc-form-stack-add-text') and contains(normalize-space(.),'Add domain')]"))
@@ -841,11 +983,8 @@ def attempt_login(driver, email, password):
                 except Exception as e:
                     print(f"  Error clicking Add domain: {e}")
 
-                # ---- Fill domain field (handle already focused vs not focused) ----
                 try:
                     domain_input = None
-
-                    # Primary: find by formcontrolname
                     try:
                         domain_input = WebDriverWait(driver, 3).until(
                             EC.presence_of_element_located((By.XPATH, "//input[@formcontrolname='domain'][@placeholder='example.com']"))
@@ -854,7 +993,6 @@ def attempt_login(driver, email, password):
                     except Exception:
                         pass
 
-                    # Fallback: last input with formcontrolname
                     if domain_input is None:
                         try:
                             all_domain_inputs = driver.find_elements(By.XPATH, "//input[@formcontrolname='domain']")
@@ -865,17 +1003,12 @@ def attempt_login(driver, email, password):
                             pass
 
                     if domain_input is not None:
-                        print("  Domain input located; checking focus state...")
-                        time.sleep(0.3)
-
-                        # Check if it's already focused (after clicking Add domain)
                         try:
                             is_focused = driver.execute_script("return document.activeElement === arguments[0];", domain_input)
                         except Exception:
                             is_focused = False
                         print(f"  Domain input focused state: {is_focused}")
 
-                        # If not focused, click the label to focus or focus the input directly
                         if not is_focused:
                             try:
                                 label = driver.find_element(By.XPATH, "//cfc-form-stack-field-label[contains(., 'Authorized domain')]")
@@ -890,7 +1023,6 @@ def attempt_login(driver, email, password):
                                 except Exception:
                                     pass
 
-                        # Now type the domain (character-by-character to be robust)
                         try:
                             domain_input.send_keys(Keys.CONTROL + "a")
                             time.sleep(0.1)
@@ -904,7 +1036,6 @@ def attempt_login(driver, email, password):
                                 pass
                             time.sleep(0.03)
 
-                        # Dispatch events for reactive forms
                         try:
                             driver.execute_script("""
                                 arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
@@ -914,7 +1045,6 @@ def attempt_login(driver, email, password):
                             pass
                         time.sleep(0.5)
 
-                        # Verify value
                         try:
                             value = domain_input.get_attribute("value")
                         except Exception:
@@ -940,7 +1070,6 @@ def attempt_login(driver, email, password):
                     print(f"  Error filling domain: {e}")
                     traceback.print_exc()
 
-                # Save branding
                 try:
                     save_btn = WebDriverWait(driver, WAIT_SECONDS).until(
                         EC.element_to_be_clickable((By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Save']/ancestor::button[1]"))
@@ -955,7 +1084,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error during Branding flow: {e}")
 
-            # ============ ADD USERS FROM add_user.txt WITH ROTATING BATCH ============
             try:
                 audience_tab = WebDriverWait(driver, WAIT_SECONDS).until(
                     EC.element_to_be_clickable((By.XPATH, "//span[contains(@class,'cfc-page-displayName') and normalize-space(.)='Audience']"))
@@ -992,7 +1120,6 @@ def attempt_login(driver, email, password):
                     elif not all_add_users:
                         print("  No emails loaded from add_user.txt.")
 
-                # Deduplicate
                 if add_users_list:
                     seen = set()
                     unique_users = []
@@ -1028,7 +1155,6 @@ def attempt_login(driver, email, password):
                         time.sleep(1)
                         print("  All emails added to chip input.")
 
-                        # Save button robust click
                         try:
                             save_btn = WebDriverWait(driver, WAIT_SECONDS).until(
                                 EC.presence_of_element_located((By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Save']/ancestor::button[1]"))
@@ -1061,7 +1187,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error during Add Users flow: {e}")
 
-            # ============ AUDIENCE: Publish/Internal Logic ============
             try:
                 status_value = None
                 try:
@@ -1079,7 +1204,6 @@ def attempt_login(driver, email, password):
                 except FileNotFoundError:
                     print("  Config file not found; defaulting to publish action.")
 
-                # Decide action: 'internal' or 'publish'
                 action = "publish"
                 if status_value == "internal":
                     action = "internal"
@@ -1115,7 +1239,6 @@ def attempt_login(driver, email, password):
             except Exception as e:
                 print(f"  Error during Audience publish/internal flow: {e}")
 
-            # ============ CLIENTS & DOWNLOAD ============
             try:
                 clients_tab = WebDriverWait(driver, WAIT_SECONDS).until(
                     EC.element_to_be_clickable((By.XPATH, "//span[contains(@class,'cfc-page-displayName') and normalize-space(.)='Clients']"))
@@ -1204,7 +1327,6 @@ def attempt_login(driver, email, password):
                 except Exception as e:
                     print(f"  Error clicking Create client button: {e}")
 
-                # snapshot existing .json files
                 download_dir = DOWNLOAD_DIR if 'DOWNLOAD_DIR' in globals() else os.getcwd()
                 if not os.path.isdir(download_dir):
                     download_dir = os.getcwd()
@@ -1225,7 +1347,6 @@ def attempt_login(driver, email, password):
                 except Exception:
                     print("  Download trigger not found/clickable; skipping click and still waiting for download.")
 
-                # Fallback: click Save in Windows dialog if it appears
                 try:
                     clicked_save = click_save_in_windows_dialog(filename_hint=".json", timeout=12)
                     if clicked_save:
@@ -1285,17 +1406,15 @@ def attempt_login(driver, email, password):
 
     return outcome
 
-# ============ MAIN FUNCTION ============
 
 def main():
-    load_config_and_emails()  # Load config and emails once at startup
+    load_config_and_emails()
 
     creds = load_credentials(CREDENTIALS_FILE)
     print(f"Loaded {len(creds)} credential pairs from {CREDENTIALS_FILE}")
 
     print("Launching Chrome ...")
 
-    # ensure Downloads folder exists (uses DOWNLOAD_DIR from your config)
     download_dir = DOWNLOAD_DIR if 'DOWNLOAD_DIR' in globals() else os.getcwd()
     os.makedirs(download_dir, exist_ok=True)
 
@@ -1322,10 +1441,8 @@ def main():
         for i, (email, password) in enumerate(creds, 1):
             print(f"[{i}/{len(creds)}] Testing {email} ...")
 
-            # Start a fresh Chrome instance for this attempt
             try:
                 driver = webdriver.Chrome(options=chrome_options)
-                # hide navigator.webdriver if possible
                 try:
                     driver.execute_cdp_cmd(
                         "Page.addScriptToEvaluateOnNewDocument",
@@ -1334,7 +1451,6 @@ def main():
                 except Exception:
                     pass
 
-                # enable downloads via CDP for this driver (must be after driver created)
                 try:
                     driver.execute_cdp_cmd("Page.setDownloadBehavior", {
                         "behavior": "allow",
@@ -1343,7 +1459,6 @@ def main():
                 except Exception as e:
                     print(f"  Warning: Page.setDownloadBehavior failed: {e}")
 
-                # run the login flow
                 try:
                     outcome = attempt_login(driver, email, password)
                 except Exception as e:
@@ -1356,7 +1471,6 @@ def main():
                 outcome = "ERROR"
 
             finally:
-                # ensure this browser instance is closed before the next iteration
                 try:
                     if driver is not None:
                         driver.quit()
@@ -1369,7 +1483,6 @@ def main():
 
             time.sleep(DELAY_BETWEEN_ATTEMPTS)
     finally:
-        # extra safety: ensure no stray browser processes remain
         try:
             if 'driver' in locals() and driver is not None:
                 driver.quit()
