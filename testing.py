@@ -378,51 +378,59 @@ def check_outcome(driver):
     return "UNKNOWN"
 
 
-def click_google_docs_share_button(driver, timeout=25):
-    exact_xpath = "//*[@id='docs-titlebar-share-client-button']//div[@role='button' and @aria-label='Share. Private to only me. ' and not(@aria-disabled='true')]"
+def click_google_docs_share_button(driver):
+    xpath = "//*[@id='docs-titlebar-share-client-button']//div[@role='button' and @aria-label='Share. Private to only me. ' and not(@aria-disabled='true')]"
 
-    # strong exact selector first
-    try:
-        share_btn = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, exact_xpath)))
-        time.sleep(0.5)
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", share_btn)
-        WebDriverWait(driver, 10).until(EC.visibility_of(share_btn))
-        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(share_btn))
-        driver.execute_script("arguments[0].click();", share_btn)
-        print("  Clicked Share button using exact DOM selector.")
-        return True
-    except Exception:
-        pass
+    for attempt in range(12):
+        try:
+            result = driver.execute_script("""
+            const wrapper = document.querySelector('#docs-titlebar-share-client-button');
+            if (!wrapper) return {ok: false, reason: 'wrapper_not_found'};
 
-    # fallback: direct wrapper + inner button
-    try:
-        wrapper = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.ID, "docs-titlebar-share-client-button")))
-        inner = wrapper.find_element(By.XPATH, ".//div[@role='button' and @aria-label='Share. Private to only me. ']")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inner)
-        WebDriverWait(driver, 10).until(EC.visibility_of(inner))
-        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(inner))
-        driver.execute_script("arguments[0].click();", inner)
-        print("  Clicked Share button via wrapper + inner button fallback.")
-        return True
-    except Exception:
-        pass
+            const btn = wrapper.querySelector('div[role="button"][aria-label="Share. Private to only me. "]');
+            if (!btn) return {ok: false, reason: 'button_not_found'};
 
-    # fallback: generic share button with label text filter
-    try:
-        buttons = driver.find_elements(By.XPATH, "//*[@role='button' and contains(@aria-label, 'Share')]")
-        for btn in buttons:
-            label = (btn.get_attribute("aria-label") or "").strip()
-            if "share" in label.lower() and "private to only me" in label.lower():
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                WebDriverWait(driver, 10).until(EC.visibility_of(btn))
-                WebDriverWait(driver, 10).until(EC.element_to_be_clickable(btn))
-                driver.execute_script("arguments[0].click();", btn)
-                print("  Clicked Share button via label filter fallback.")
+            const rect = btn.getBoundingClientRect();
+            if (!rect.width || !rect.height) return {ok: false, reason: 'not_visible'};
+
+            const style = window.getComputedStyle(btn);
+            if (style.pointerEvents === 'none' || style.display === 'none' || style.visibility === 'hidden') {
+                return {ok: false, reason: 'blocked_by_css'};
+            }
+
+            btn.scrollIntoView({block: 'center', inline: 'center'});
+            btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+            btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+            btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+
+            return {ok: true, reason: 'clicked'};
+            """)
+            print(f"  Share button live DOM click attempt {attempt + 1}: {result}")
+
+            time.sleep(1)
+
+            share_modal = driver.execute_script("""
+            const candidates = [
+                '[role="dialog"]',
+                '[aria-label*="Share"]',
+                '[aria-label*="People"]',
+                '[aria-label*="Invite"]'
+            ];
+            for (const sel of candidates) {
+                if (document.querySelector(sel)) return true;
+            }
+            return false;
+            """)
+            if share_modal:
+                print("  Share modal/dialog opened.")
                 return True
-    except Exception:
-        pass
 
-    print("  Share button not found or not clickable.")
+        except Exception as e:
+            print(f"  Share button JS click attempt {attempt + 1} failed: {e}")
+
+        time.sleep(1)
+
+    print("  Share button still not clickable from the live DOM.")
     return False
 
 
@@ -653,7 +661,9 @@ def attempt_login(driver, email, password):
         time.sleep(25)
 
         try:
-            click_google_docs_share_button(driver)
+            if not click_google_docs_share_button(driver):
+                print("  Sharing flow aborted: share button not clickable from live DOM.")
+                return outcome
         except Exception as e:
             print(f"  Share button click wrapper raised exception: {e}")
             raise
