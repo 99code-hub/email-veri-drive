@@ -14,7 +14,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 
-LOGIN_URL = "https://console.cloud.google.com/projectcreate"
+LOGIN_URL = "https://docs.google.com/document"
 CREDENTIALS_FILE = "credentials.txt"
 RESULTS_FILE = "login_test_results.csv"
 
