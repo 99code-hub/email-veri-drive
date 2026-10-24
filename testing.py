@@ -175,33 +175,69 @@ def parse_email_lines(lines):
     return valid, errors
 
 
-def find_share_email_input(driver, timeout=15):
+def find_share_people_input(driver, timeout=15):
     selectors = [
-        "input[aria-label*='Add people']",
-        "input[aria-label*='Email']",
-        "textarea[aria-label*='Add people']",
-        "input[placeholder*='Add people']",
-        "input[placeholder*='Email']",
-        "[role='combobox'][aria-label*='Add people']",
-        "[role='combobox'][aria-label*='people']",
-        "input[jsname='YPqjbf']",
-        "input[role='combobox']",
+        (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.XPATH, "//input[@jsname='YPqjbf']"),
+        (By.XPATH, "//div[@jsname='w1sQPc']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
+        (By.XPATH, "//input[contains(@aria-label, 'Add people') and contains(@aria-label, 'calendar events')]"),
     ]
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        for selector in selectors:
+
+    for by, selector in selectors:
+        try:
+            el = WebDriverWait(driver, timeout).until(
+                EC.visibility_of_element_located((by, selector))
+            )
+            return el
+        except Exception:
+            continue
+    return None
+
+
+def paste_emails_into_share_input(driver, emails):
+    input_field = find_share_people_input(driver, timeout=15)
+    if input_field is None:
+        print("  Share dialog email input not found after clicking Share.")
+        return False
+
+    try:
+        driver.execute_script("""
+            arguments[0].focus();
+            arguments[0].scrollIntoView({block: 'center', inline: 'center'});
+            arguments[0].click();
+        """, input_field)
+
+        time.sleep(0.6)
+
+        for email in emails:
+            email = str(email).strip()
+            if not email:
+                continue
+
+            driver.execute_script("""
+                arguments[0].value = arguments[1];
+                arguments[0].dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: arguments[1]
+                }));
+                arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+            """, input_field, email)
+
+            time.sleep(0.2)
             try:
-                el = driver.find_element(By.CSS_SELECTOR, selector)
-                if el.is_displayed():
-                    try:
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].focus();", el)
-                    except Exception:
-                        pass
-                    return el
+                input_field.send_keys(Keys.ENTER)
+                time.sleep(0.5)
             except Exception:
                 pass
-        time.sleep(0.3)
-    return None
+
+        print(f"  Added {len([e for e in emails if str(e).strip()])} recipients to Google Docs share combobox.")
+        return True
+    except Exception as e:
+        print(f"  Failed to add recipients to Google Docs share combobox: {e}")
+        return False
 
 
 def process_email_file_in_batches(driver, input_path, limit):
@@ -223,25 +259,9 @@ def process_email_file_in_batches(driver, input_path, limit):
         batch = lines[batch_index:batch_index + limit]
         print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
 
-        email_input = find_share_email_input(driver, timeout=15)
-        if not email_input:
-            print("  Could not find the share dialog email input; skipping batch.")
+        if not paste_emails_into_share_input(driver, batch):
+            print("  Could not paste this batch into the share field; skipping batch.")
             continue
-
-        try:
-            email_input.clear()
-        except Exception:
-            pass
-        try:
-            email_input.send_keys("\n".join(batch))
-            print("  Pasted batch into share email box.")
-        except Exception:
-            try:
-                driver.execute_script("arguments[0].value = arguments[1];", email_input, "\n".join(batch))
-                print("  Pasted batch via JS fallback.")
-            except Exception:
-                print("  Could not write to share email input; skipping batch.")
-                continue
 
         time.sleep(30)
 
@@ -364,38 +384,6 @@ def click_next_button(driver):
     return False
 
 
-def click_private_to_only_me(driver, timeout=10):
-    end_time = time.time() + timeout
-    selectors = [
-        (By.XPATH, "//div[normalize-space(.)='Private to only me']"),
-        (By.XPATH, "//span[normalize-space(.)='Private to only me']"),
-        (By.XPATH, "//div[@role='menuitem' and normalize-space(.)='Private to only me']"),
-        (By.XPATH, "//button[normalize-space(.)='Private to only me']"),
-        (By.XPATH, "//*[@role='button' and contains(normalize-space(.), 'Private to only me')]"),
-        (By.XPATH, "//*[contains(normalize-space(.), 'Private to only me')]"),
-    ]
-
-    while time.time() < end_time:
-        for by, value in selectors:
-            try:
-                matches = driver.find_elements(by, value)
-                for el in matches:
-                    try:
-                        if el.is_displayed():
-                            try:
-                                driver.execute_script("arguments[0].click();", el)
-                            except Exception:
-                                el.click()
-                            print("  Clicked 'Private to only me'.")
-                            return True
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        time.sleep(0.4)
-    return False
-
-
 def find_visible_input(driver, input_type, manual_selector=None):
     try:
         if manual_selector:
@@ -443,6 +431,60 @@ def check_outcome(driver):
                 pass
         time.sleep(0.3)
     return "UNKNOWN"
+
+
+def click_google_docs_share_button(driver):
+    for attempt in range(12):
+        try:
+            result = driver.execute_script("""
+            const wrapper = document.querySelector('#docs-titlebar-share-client-button');
+            if (!wrapper) return {ok: false, reason: 'wrapper_not_found'};
+
+            const btn = wrapper.querySelector('div[role="button"][aria-label="Share. Private to only me. "]');
+            if (!btn) return {ok: false, reason: 'button_not_found'};
+
+            const rect = btn.getBoundingClientRect();
+            if (!rect.width || !rect.height) return {ok: false, reason: 'not_visible'};
+
+            const style = window.getComputedStyle(btn);
+            if (style.pointerEvents === 'none' || style.display === 'none' || style.visibility === 'hidden') {
+                return {ok: false, reason: 'blocked_by_css'};
+            }
+
+            btn.scrollIntoView({block: 'center', inline: 'center'});
+            btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+            btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+            btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+
+            return {ok: true, reason: 'clicked'};
+            """)
+            print(f"  Share button live DOM click attempt {attempt + 1}: {result}")
+
+            time.sleep(1)
+
+            share_modal = driver.execute_script("""
+            const candidates = [
+                '[role="dialog"]',
+                '[aria-label*="Share"]',
+                '[aria-label*="People"]',
+                '[aria-label*="Invite"]'
+            ];
+            for (const sel of candidates) {
+                if (document.querySelector(sel)) return true;
+            }
+            return false;
+            """)
+            if share_modal:
+                print("  Share modal/dialog opened.")
+                return True
+
+        except Exception as e:
+            print(f"  Share button JS click attempt {attempt + 1} failed: {e}")
+
+        time.sleep(1)
+
+    print("  Share button still not clickable from the live DOM.")
+    return False
 
 
 def attempt_login(driver, email, password):
@@ -672,37 +714,14 @@ def attempt_login(driver, email, password):
         time.sleep(25)
 
         try:
-            share_wrapper = WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.ID, "docs-titlebar-share-client-button"))
-            )
-            share_btn = WebDriverWait(share_wrapper, 20).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, ".//div[@role='button' and contains(@aria-label, 'Share.') and contains(@class, 'docs-titlebar-button')]")
-                )
-            )
-            print("  Found Share button inside docs-titlebar-share-client-button.")
-            try:
-                driver.execute_script("arguments[0].click();", share_btn)
-                print("  Clicked Share button via JS.")
-            except Exception:
-                share_btn.click()
-                print("  Clicked Share button via direct click.")
-        except Exception:
-            try:
-                share_btn = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable(
-                        (By.XPATH, "//div[@role='button' and contains(@aria-label, 'Share.') and contains(@class, 'docs-titlebar-button')]")
-                    )
-                )
-                driver.execute_script("arguments[0].click();", share_btn)
-                print("  Clicked Share button via fallback XPath.")
-            except Exception:
-                print("  Share button still not found.")
-                raise
+            if not click_google_docs_share_button(driver):
+                print("  Sharing flow aborted: share button not clickable from live DOM.")
+                return outcome
+        except Exception as e:
+            print(f"  Share button click wrapper raised exception: {e}")
+            raise
 
         time.sleep(10)
-
-        click_private_to_only_me(driver)
 
         limit = read_limit_from_conf()
         input_path = get_email_input_path()
