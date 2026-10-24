@@ -259,9 +259,25 @@ def process_email_file_in_batches(driver, input_path, limit):
         batch = lines[batch_index:batch_index + limit]
         print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
 
-        if not paste_emails_into_share_input(driver, batch):
-            print("  Could not paste this batch into the share field; skipping batch.")
+        email_input = find_share_email_input(driver, timeout=15)
+        if not email_input:
+            print("  Could not find the share dialog email input; skipping batch.")
             continue
+
+        try:
+            email_input.clear()
+        except Exception:
+            pass
+        try:
+            email_input.send_keys("\n".join(batch))
+            print("  Pasted batch into share email box.")
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].value = arguments[1];", email_input, "\n".join(batch))
+                print("  Pasted batch via JS fallback.")
+            except Exception:
+                print("  Could not write to share email input; skipping batch.")
+                continue
 
         time.sleep(30)
 
