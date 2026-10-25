@@ -177,14 +177,13 @@ def parse_email_lines(lines):
 
 def find_share_people_input(driver, timeout=15):
     selectors = [
+        (By.CSS_SELECTOR, "input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
+        (By.XPATH, "//input[@role='combobox' and @jsname='YPqjbf' and @aria-label='Add people, groups, spaces, and calendar events']"),
         (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
         (By.XPATH, "//input[@jsname='YPqjbf']"),
         (By.XPATH, "//div[@jsname='w1sQPc']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.XPATH, "//input[@role='combobox' and @jsname='YPqjbf']"),
         (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
         (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
-        (By.CSS_SELECTOR, "input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
-        (By.CSS_SELECTOR, "input.zeumMd.d2j1H[aria-label='Add people, groups, spaces, and calendar events']"),
         (By.XPATH, "//input[contains(@aria-label, 'Add people') and contains(@aria-label, 'calendar events')]"),
     ]
 
@@ -243,6 +242,63 @@ def paste_emails_into_share_input(driver, emails):
         return False
 
 
+def paste_batch_into_share_input(driver, emails):
+    input_field = find_share_people_input(driver, timeout=20)
+    if input_field is None:
+        print("  Share dialog email input not found after clicking Share.")
+        return False
+
+    try:
+        for email in emails:
+            email = str(email).strip()
+            if not email:
+                continue
+
+            try:
+                input_field.clear()
+            except Exception:
+                pass
+
+            driver.execute_script("""
+                arguments[0].focus();
+                arguments[0].scrollIntoView({block: 'center', inline: 'center'});
+            """, input_field)
+
+            input_field.send_keys(email)
+            time.sleep(0.4)
+
+            try:
+                input_field.send_keys(Keys.ENTER)
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+            try:
+                driver.execute_script("""
+                    arguments[0].value = arguments[1];
+                    arguments[0].dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: arguments[1]
+                    }));
+                    arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+                """, input_field, email)
+                time.sleep(0.2)
+                try:
+                    input_field.send_keys(Keys.ENTER)
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        print(f"  Added {len([e for e in emails if str(e).strip()])} recipients via individual combobox entries.")
+        return True
+    except Exception as e:
+        print(f"  Failed to paste batch into share combobox: {e}")
+        return False
+
+
 def process_email_file_in_batches(driver, input_path, limit):
     try:
         with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -268,19 +324,12 @@ def process_email_file_in_batches(driver, input_path, limit):
             continue
 
         try:
-            email_input.clear()
-        except Exception:
-            pass
-        try:
-            email_input.send_keys("\n".join(batch))
-            print("  Pasted batch into share email box.")
-        except Exception:
-            try:
-                driver.execute_script("arguments[0].value = arguments[1];", email_input, "\n".join(batch))
-                print("  Pasted batch via JS fallback.")
-            except Exception:
-                print("  Could not write to share email input; skipping batch.")
+            if not paste_batch_into_share_input(driver, batch):
+                print("  Batch paste failed; skipping batch.")
                 continue
+        except Exception as e:
+            print(f"  Batch paste raised exception: {e}")
+            continue
 
         time.sleep(30)
 
