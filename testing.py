@@ -179,7 +179,7 @@ def wait_for_share_modal(driver, timeout=20):
     end_time = time.time() + timeout
     while time.time() < end_time:
         try:
-            dialogs = driver.find_elements(By.XPATH, "//div[@role='dialog' or @aria-label='Share \"Resume\"' or contains(@aria-label, 'Share')]")
+            dialogs = driver.find_elements(By.XPATH, "//div[@role='dialog']")
             for d in dialogs:
                 try:
                     if d.is_displayed():
@@ -190,9 +190,9 @@ def wait_for_share_modal(driver, timeout=20):
             pass
 
         try:
-            share_title = driver.find_element(By.XPATH, "//*[contains(text(), 'Share \"Resume\"') or contains(@aria-label, 'Share')]")
-            if share_title.is_displayed():
-                return share_title
+            share_header = driver.find_element(By.XPATH, "//*[contains(text(), 'Share \"Resume\"') or contains(@aria-label, 'Share')]")
+            if share_header.is_displayed():
+                return share_header
         except Exception:
             pass
 
@@ -200,7 +200,7 @@ def wait_for_share_modal(driver, timeout=20):
     return None
 
 
-def find_share_people_input(driver, timeout=15):
+def find_share_people_input(driver, timeout=20):
     end_time = time.time() + timeout
     dialog = wait_for_share_modal(driver, timeout=5)
 
@@ -213,9 +213,7 @@ def find_share_people_input(driver, timeout=15):
         (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
         (By.XPATH, "//input[@jsname='YPqjbf']"),
         (By.XPATH, "//div[@role='dialog']//input[@jsname='YPqjbf']"),
-        (By.XPATH, "//div[contains(@aria-label, 'Share')]//input[@jsname='YPqjbf']"),
         (By.XPATH, "//div[@role='dialog']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.XPATH, "//div[contains(@aria-label, 'Share')]//input[@aria-label='Add people, groups, spaces, and calendar events']"),
     ]
 
     while time.time() < end_time:
@@ -235,6 +233,37 @@ def find_share_people_input(driver, timeout=15):
             except Exception:
                 pass
 
+        try:
+            result = driver.execute_script("""
+            const selectors = [
+                "input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']",
+                "input[role='combobox'][jsname='YPqjbf']",
+                "input[aria-label='Add people, groups, spaces, and calendar events']",
+                "input[jsname='YPqjbf']",
+                "div[role='dialog'] input[jsname='YPqjbf']",
+                "div[role='dialog'] input[aria-label='Add people, groups, spaces, and calendar events']"
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null) {
+                    return sel;
+                }
+            }
+            return null;
+            """)
+            if result:
+                by, selector = (By.CSS_SELECTOR, result)
+                try:
+                    el = WebDriverWait(driver, 2).until(
+                        EC.visibility_of_element_located((by, selector))
+                    )
+                    if el:
+                        return el
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         for by, selector in selectors:
             try:
                 candidates = driver.find_elements(by, selector)
@@ -253,64 +282,22 @@ def find_share_people_input(driver, timeout=15):
     return None
 
 
-def paste_emails_into_share_input(driver, emails):
-    input_field = find_share_people_input(driver, timeout=20)
-    if input_field is None:
-        print("  Share dialog email input not found after clicking Share.")
-        return False
-
+def click_share_input(driver, input_field):
     try:
         driver.execute_script("""
-            arguments[0].focus();
             arguments[0].scrollIntoView({block: 'center', inline: 'center'});
             arguments[0].click();
+            arguments[0].focus();
         """, input_field)
-
-        time.sleep(0.6)
-
-        for email in emails:
-            email = str(email).strip()
-            if not email:
-                continue
-
-            try:
-                input_field.clear()
-            except Exception:
-                pass
-
-            input_field.send_keys(email)
-            time.sleep(0.25)
-
-            try:
-                input_field.send_keys(Keys.ENTER)
-                time.sleep(0.5)
-            except Exception:
-                pass
-
-            try:
-                driver.execute_script("""
-                    arguments[0].value = arguments[1];
-                    arguments[0].dispatchEvent(new InputEvent('input', {
-                        bubbles: true,
-                        inputType: 'insertText',
-                        data: arguments[1]
-                    }));
-                    arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-                """, input_field, email)
-                time.sleep(0.2)
-                try:
-                    input_field.send_keys(Keys.ENTER)
-                    time.sleep(0.5)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        print(f"  Added {len([e for e in emails if str(e).strip()])} recipients to Google Docs share combobox.")
+        time.sleep(0.3)
         return True
-    except Exception as e:
-        print(f"  Failed to add recipients to Google Docs share combobox: {e}")
-        return False
+    except Exception:
+        try:
+            input_field.click()
+            time.sleep(0.3)
+            return True
+        except Exception:
+            return False
 
 
 def paste_batch_into_share_input(driver, emails):
@@ -319,6 +306,10 @@ def paste_batch_into_share_input(driver, emails):
         print("  Share dialog email input not found after clicking Share.")
         return False
 
+    if not click_share_input(driver, input_field):
+        print("  Found share field but could not click it.")
+        return False
+
     try:
         for email in emails:
             email = str(email).strip()
@@ -330,38 +321,30 @@ def paste_batch_into_share_input(driver, emails):
             except Exception:
                 pass
 
-            driver.execute_script("""
-                arguments[0].focus();
-                arguments[0].scrollIntoView({block: 'center', inline: 'center'});
-            """, input_field)
-
-            input_field.send_keys(email)
-            time.sleep(0.35)
-
             try:
+                input_field.send_keys(email)
+                time.sleep(0.25)
                 input_field.send_keys(Keys.ENTER)
                 time.sleep(0.5)
             except Exception:
-                pass
-
-            try:
-                driver.execute_script("""
-                    arguments[0].value = arguments[1];
-                    arguments[0].dispatchEvent(new InputEvent('input', {
-                        bubbles: true,
-                        inputType: 'insertText',
-                        data: arguments[1]
-                    }));
-                    arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-                """, input_field, email)
-                time.sleep(0.2)
                 try:
-                    input_field.send_keys(Keys.ENTER)
+                    driver.execute_script("""
+                        arguments[0].value = arguments[1];
+                        arguments[0].dispatchEvent(new InputEvent('input', {
+                            bubbles: true,
+                            inputType: 'insertText',
+                            data: arguments[1]
+                        }));
+                        arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+                    """, input_field, email)
+                    time.sleep(0.2)
+                    try:
+                        input_field.send_keys(Keys.ENTER)
+                    except Exception:
+                        pass
                     time.sleep(0.5)
                 except Exception:
                     pass
-            except Exception:
-                pass
 
         print(f"  Added {len([e for e in emails if str(e).strip()])} recipients via individual combobox entries.")
         return True
