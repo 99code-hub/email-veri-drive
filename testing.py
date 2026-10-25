@@ -175,31 +175,86 @@ def parse_email_lines(lines):
     return valid, errors
 
 
+def wait_for_share_modal(driver, timeout=20):
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        try:
+            dialogs = driver.find_elements(By.XPATH, "//div[@role='dialog' or @aria-label='Share \"Resume\"' or contains(@aria-label, 'Share')]")
+            for d in dialogs:
+                try:
+                    if d.is_displayed():
+                        return d
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            share_title = driver.find_element(By.XPATH, "//*[contains(text(), 'Share \"Resume\"') or contains(@aria-label, 'Share')]")
+            if share_title.is_displayed():
+                return share_title
+        except Exception:
+            pass
+
+        time.sleep(0.3)
+    return None
+
+
 def find_share_people_input(driver, timeout=15):
+    end_time = time.time() + timeout
+    dialog = wait_for_share_modal(driver, timeout=5)
+
     selectors = [
         (By.CSS_SELECTOR, "input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
+        (By.CSS_SELECTOR, "input[role='combobox'][jsname='YPqjbf']"),
+        (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
         (By.XPATH, "//input[@role='combobox' and @jsname='YPqjbf' and @aria-label='Add people, groups, spaces, and calendar events']"),
         (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
         (By.XPATH, "//input[@jsname='YPqjbf']"),
-        (By.XPATH, "//div[@jsname='w1sQPc']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
-        (By.XPATH, "//input[contains(@aria-label, 'Add people') and contains(@aria-label, 'calendar events')]"),
+        (By.XPATH, "//div[@role='dialog']//input[@jsname='YPqjbf']"),
+        (By.XPATH, "//div[contains(@aria-label, 'Share')]//input[@jsname='YPqjbf']"),
+        (By.XPATH, "//div[@role='dialog']//input[@aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.XPATH, "//div[contains(@aria-label, 'Share')]//input[@aria-label='Add people, groups, spaces, and calendar events']"),
     ]
 
-    for by, selector in selectors:
-        try:
-            el = WebDriverWait(driver, timeout).until(
-                EC.visibility_of_element_located((by, selector))
-            )
-            return el
-        except Exception:
-            continue
+    while time.time() < end_time:
+        if dialog is not None:
+            try:
+                for by, selector in selectors:
+                    try:
+                        candidates = dialog.find_elements(by, selector)
+                        for el in candidates:
+                            try:
+                                if el.is_displayed() and el.is_enabled():
+                                    return el
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        for by, selector in selectors:
+            try:
+                candidates = driver.find_elements(by, selector)
+                for el in candidates:
+                    try:
+                        if el.is_displayed() and el.is_enabled():
+                            return el
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        time.sleep(0.3)
+        dialog = wait_for_share_modal(driver, timeout=2)
+
     return None
 
 
 def paste_emails_into_share_input(driver, emails):
-    input_field = find_share_people_input(driver, timeout=15)
+    input_field = find_share_people_input(driver, timeout=20)
     if input_field is None:
         print("  Share dialog email input not found after clicking Share.")
         return False
@@ -218,20 +273,36 @@ def paste_emails_into_share_input(driver, emails):
             if not email:
                 continue
 
-            driver.execute_script("""
-                arguments[0].value = arguments[1];
-                arguments[0].dispatchEvent(new InputEvent('input', {
-                    bubbles: true,
-                    inputType: 'insertText',
-                    data: arguments[1]
-                }));
-                arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-            """, input_field, email)
+            try:
+                input_field.clear()
+            except Exception:
+                pass
 
-            time.sleep(0.2)
+            input_field.send_keys(email)
+            time.sleep(0.25)
+
             try:
                 input_field.send_keys(Keys.ENTER)
                 time.sleep(0.5)
+            except Exception:
+                pass
+
+            try:
+                driver.execute_script("""
+                    arguments[0].value = arguments[1];
+                    arguments[0].dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: arguments[1]
+                    }));
+                    arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+                """, input_field, email)
+                time.sleep(0.2)
+                try:
+                    input_field.send_keys(Keys.ENTER)
+                    time.sleep(0.5)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -265,7 +336,7 @@ def paste_batch_into_share_input(driver, emails):
             """, input_field)
 
             input_field.send_keys(email)
-            time.sleep(0.4)
+            time.sleep(0.35)
 
             try:
                 input_field.send_keys(Keys.ENTER)
@@ -318,7 +389,7 @@ def process_email_file_in_batches(driver, input_path, limit):
         batch = lines[batch_index:batch_index + limit]
         print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
 
-        email_input = find_share_people_input(driver, timeout=15)
+        email_input = find_share_people_input(driver, timeout=20)
         if not email_input:
             print("  Could not find the share dialog email input; skipping batch.")
             continue
