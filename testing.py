@@ -6,6 +6,8 @@ import random
 import re
 import sys
 import os
+import glob
+import shutil
 import traceback
 
 from selenium import webdriver
@@ -14,6 +16,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 LOGIN_URL = "https://docs.google.com/document"
 CREDENTIALS_FILE = "credentials.txt"
@@ -26,9 +29,16 @@ NEXT_BUTTON_TEXTS = ["Next", "Continue", "Sign in", "Log in", "Login"]
 EMAIL_INPUT_SELECTOR = (By.ID, "identifierId")
 PASSWORD_INPUT_SELECTOR = (By.NAME, "Passwd")
 
+CREATE_BUTTON_SELECTOR = (By.CSS_SELECTOR, "button.projtest-create-form-submit")
 CONSENT_CHECKBOX_SELECTOR = (By.CSS_SELECTOR, "input.mdc-checkbox__native-control")
 AGREE_BUTTON_XPATH = "//*[contains(text(), 'Agree and continue')]"
+AFTER_CREATE_URL_CONTAINS = "https://console.cloud.google.com/apis/library/gmail.googleapis.com"
+AFTER_CREATE_URL_CONTAINS2 = "https://console.cloud.google.com/auth/overview"
+ENABLE_BUTTON_XPATH = "//span[contains(@class,'mdc-button__label') and contains(text(),'Enable')]"
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+SUCCESS_URL_CONTAINS = "/dashboard"
+SUCCESS_ELEMENT_SELECTOR = None
+ERROR_ELEMENT_SELECTOR = None
 
 TEXT_FILE_PATH = "Text File.txt"
 INPUT_FALLBACK_PATH = "input.txt"
@@ -59,21 +69,23 @@ def load_config_and_emails():
                     if k == "add_user":
                         try:
                             add_user_batch_size = int(v)
+                            print(f"Config: add_user batch size = {add_user_batch_size}")
                         except ValueError:
-                            pass
+                            print(f"Warning: Invalid add_user value '{v}', ignoring.")
     except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+        print("Config file not found.")
+    except Exception as e:
+        print(f"Error reading config: {e}")
 
     add_user_filename = "add_user.txt"
     try:
         with open(add_user_filename, "r", encoding="utf-8") as auf:
             all_add_users = [line.strip() for line in auf if line.strip()]
+        print(f"Loaded {len(all_add_users)} total emails from {add_user_filename}")
     except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+        print(f"{add_user_filename} not found, add_user feature will be skipped.")
+    except Exception as e:
+        print(f"Error reading {add_user_filename}: {e}")
 
 
 def get_email_input_path():
@@ -89,18 +101,17 @@ def read_limit_from_conf(conf_path=CONF_PATH):
     try:
         if not os.path.exists(conf_path):
             return default_limit
-        with open(conf_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                if s.lower().startswith("limit="):
-                    try:
-                        val = int(s.split("=", 1)[1].strip())
-                        if val > 0:
-                            return val
-                    except ValueError:
-                        pass
+        for line in open(conf_path, "r", encoding="utf-8", errors="ignore"):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.lower().startswith("limit="):
+                try:
+                    val = int(s.split("=", 1)[1].strip())
+                    if val > 0:
+                        return val
+                except ValueError:
+                    pass
     except Exception:
         pass
     return default_limit
@@ -193,12 +204,12 @@ def find_share_people_input(driver, timeout=20):
     dialog = wait_for_share_modal(driver, timeout=5)
 
     selectors = [
-        (By.CSS_SELECTOR, "input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
-        (By.CSS_SELECTOR, "div[jsname='w1sQPc'] input[jsname='YPqjbf']"),
+        (By.CSS_SELECTOR, "div[jsname='w1sQPc'] input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
+        (By.CSS_SELECTOR, "div[jsname='w1sQPc'] input[role='combobox'][jsname='YPqjbf']"),
         (By.CSS_SELECTOR, "div[jsname='w1sQPc'] input[aria-label='Add people, groups, spaces, and calendar events']"),
+        (By.CSS_SELECTOR, "input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
         (By.CSS_SELECTOR, "input[role='combobox'][jsname='YPqjbf']"),
         (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.CSS_SELECTOR, "input[jsname='YPqjbf']"),
         (By.XPATH, "//div[jsname='w1sQPc']//input[@jsname='YPqjbf']"),
         (By.XPATH, "//div[@role='dialog']//input[@jsname='YPqjbf']"),
         (By.XPATH, "//input[@role='combobox' and @jsname='YPqjbf']"),
@@ -209,8 +220,8 @@ def find_share_people_input(driver, timeout=20):
         if dialog is not None:
             for by, selector in selectors:
                 try:
-                    candidates = dialog.find_elements(by, selector)
-                    for el in candidates:
+                    els = dialog.find_elements(by, selector)
+                    for el in els:
                         try:
                             if el.is_displayed() and el.is_enabled():
                                 return el
@@ -221,7 +232,8 @@ def find_share_people_input(driver, timeout=20):
 
         for by, selector in selectors:
             try:
-                for el in driver.find_elements(by, selector):
+                els = driver.find_elements(by, selector)
+                for el in els:
                     try:
                         if el.is_displayed() and el.is_enabled():
                             return el
@@ -266,14 +278,18 @@ def type_email_into_share_box(driver, input_field, email):
             pass
 
         input_field.send_keys(email)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
         driver.execute_script("""
-            arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+            arguments[0].dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                inputType: 'insertText',
+                data: arguments[1]
+            }));
             arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-        """, input_field)
+        """, input_field, email)
 
-        time.sleep(0.4)
+        time.sleep(0.3)
         return True
     except Exception:
         return False
@@ -295,7 +311,7 @@ def paste_batch_no_enter(driver, emails):
             if not email:
                 continue
             type_email_into_share_box(driver, input_field, email)
-            time.sleep(0.3)
+            time.sleep(0.2)
         print(f"  Added {len([e for e in emails if str(e).strip()])} recipients without pressing Enter.")
         return True
     except Exception as e:
@@ -352,6 +368,78 @@ def process_email_file_in_batches(driver, input_path, limit):
         time.sleep(1)
 
 
+def click_save_in_windows_dialog(filename_hint=None, timeout=12):
+    if "Desktop" not in globals() or Desktop is None:
+        return False
+
+    end_time = time.time() + timeout
+    desktop = Desktop(backend="uia")
+    while time.time() < end_time:
+        try:
+            candidates = []
+            if filename_hint:
+                candidates.append({"title_re": f".*{re.escape(filename_hint)}.*"})
+            candidates += [
+                {"title_re": ".*Save As.*"},
+                {"title_re": ".*File Download.*"},
+                {"title_re": ".*Open.*"},
+            ]
+
+            dlg = None
+            for c in candidates:
+                try:
+                    w = desktop.window(**c)
+                    if w.exists(timeout=0.3):
+                        dlg = w
+                        break
+                except Exception:
+                    dlg = None
+
+            if dlg is None:
+                for w in desktop.windows():
+                    try:
+                        if w.child_window(title="Save", control_type="Button").exists(timeout=0.05):
+                            dlg = w
+                            break
+                    except Exception:
+                        continue
+
+            if dlg is not None and dlg.exists():
+                try:
+                    btn = dlg.child_window(title="Save", control_type="Button")
+                    if not btn.exists():
+                        for alt in ("&Save", "Save(&S)", "Save &As", "OK"):
+                            try:
+                                btn = dlg.child_window(title=alt, control_type="Button")
+                                if btn.exists():
+                                    break
+                            except Exception:
+                                continue
+                    if btn.exists():
+                        btn.click_input()
+                        return True
+                    dlg.type_keys("{ENTER}")
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return False
+
+
+def load_credentials(path):
+    creds = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            email, password = line.split("|", 1)
+            creds.append((email.strip(), password.strip()))
+    return creds
+
+
 def click_next_button(driver):
     for text in NEXT_BUTTON_TEXTS:
         xpath = (
@@ -398,10 +486,23 @@ def check_outcome(driver):
     end_time = time.time() + WAIT_SECONDS
     while time.time() < end_time:
         try:
-            if "/dashboard" in driver.current_url:
+            if SUCCESS_URL_CONTAINS and SUCCESS_URL_CONTAINS in driver.current_url:
                 return "SUCCESS"
         except Exception:
             pass
+        if SUCCESS_ELEMENT_SELECTOR:
+            try:
+                driver.find_element(*SUCCESS_ELEMENT_SELECTOR)
+                return "SUCCESS"
+            except Exception:
+                pass
+        if ERROR_ELEMENT_SELECTOR:
+            try:
+                el = driver.find_element(*ERROR_ELEMENT_SELECTOR)
+                if el.is_displayed():
+                    return "FAILED"
+            except Exception:
+                pass
         time.sleep(0.3)
     return "UNKNOWN"
 
@@ -412,39 +513,51 @@ def click_google_docs_share_button(driver):
             result = driver.execute_script("""
             const wrapper = document.querySelector('#docs-titlebar-share-client-button');
             if (!wrapper) return {ok: false, reason: 'wrapper_not_found'};
+
             const btn = wrapper.querySelector('div[role="button"][aria-label="Share. Private to only me. "]');
             if (!btn) return {ok: false, reason: 'button_not_found'};
+
             const rect = btn.getBoundingClientRect();
             if (!rect.width || !rect.height) return {ok: false, reason: 'not_visible'};
+
             const style = window.getComputedStyle(btn);
             if (style.pointerEvents === 'none' || style.display === 'none' || style.visibility === 'hidden') {
                 return {ok: false, reason: 'blocked_by_css'};
             }
+
             btn.scrollIntoView({block: 'center', inline: 'center'});
             btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
             btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
             btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+
             return {ok: true, reason: 'clicked'};
             """)
-            print(f"  Share button attempt {attempt + 1}: {result}")
+            print(f"  Share button live DOM click attempt {attempt + 1}: {result}")
 
             time.sleep(1)
 
             share_modal = driver.execute_script("""
-            const cands = ['[role="dialog"]', '[aria-label*="Share"]', '[aria-label*="People"]', '[aria-label*="Invite"]'];
-            for (const sel of cands) {
+            const candidates = [
+                '[role="dialog"]',
+                '[aria-label*="Share"]',
+                '[aria-label*="People"]',
+                '[aria-label*="Invite"]'
+            ];
+            for (const sel of candidates) {
                 if (document.querySelector(sel)) return true;
             }
             return false;
             """)
             if share_modal:
+                print("  Share modal/dialog opened.")
                 return True
 
         except Exception as e:
-            print(f"  Share button JS failed: {e}")
+            print(f"  Share button JS click attempt {attempt + 1} failed: {e}")
+
         time.sleep(1)
 
-    print("  Share button still not clickable from live DOM.")
+    print("  Share button still not clickable from the live DOM.")
     return False
 
 
@@ -459,7 +572,11 @@ def attempt_login(driver, email, password):
                         (By.XPATH, "//span[contains(@class,'mdc-button__label') and normalize-space(.)='Remind me later']/ancestor::button[1]")
                     )
                 )
-                driver.execute_script("arguments[0].click();", btn)
+                try:
+                    driver.execute_script("arguments[0].click();", btn)
+                except Exception:
+                    btn.click()
+                print("  Clicked 'Remind me later' (button ancestor).")
                 time.sleep(0.8)
                 return True
             except Exception:
@@ -467,43 +584,99 @@ def attempt_login(driver, email, password):
                 if spans:
                     try:
                         driver.execute_script("arguments[0].click();", spans[0])
+                        print("  Clicked 'Remind me later' (span fallback).")
                         time.sleep(0.8)
                         return True
                     except Exception:
                         try:
                             spans[0].click()
+                            print("  Clicked 'Remind me later' (span.click fallback).")
                             time.sleep(0.8)
                             return True
                         except Exception:
-                            pass
+                            print("  Found 'Remind me later' but could not click it.")
         except Exception:
             pass
         return False
 
     def click_do_this_later(timeout=4):
         try:
-            do_later = WebDriverWait(driver, timeout).until(
-                EC.element_to_be_clickable((By.XPATH, "//a[normalize-space(.)='Do this later' or contains(normalize-space(.),'Do this later')]"))
-            )
-            driver.execute_script("arguments[0].click();", do_later)
-            time.sleep(1)
-            return True
-        except Exception:
             try:
+                do_later = WebDriverWait(driver, timeout).until(
+                    EC.element_to_be_clickable((By.XPATH, "//a[normalize-space(.)='Do this later' or contains(normalize-space(.),'Do this later')]"))
+                )
+                try:
+                    driver.execute_script("arguments[0].click();", do_later)
+                    print("  Clicked 'Do this later' link (direct wait).")
+                except Exception:
+                    try:
+                        do_later.click()
+                        print("  Clicked 'Do this later' link (element.click fallback).")
+                    except Exception:
+                        print("  Could not click 'Do this later' with element.click; attempted JS click already.")
+                time.sleep(1)
+                return True
+            except Exception:
                 anchors = driver.find_elements(By.XPATH, "//a[contains(@href,'ServiceLogin') and (normalize-space(.)='Do this later' or contains(normalize-space(.),'Do this later'))]")
                 if anchors:
-                    driver.execute_script("arguments[0].click();", anchors[0])
+                    try:
+                        driver.execute_script("arguments[0].click();", anchors[0])
+                        print("  Clicked 'Do this later' anchor (href fallback).")
+                    except Exception:
+                        try:
+                            anchors[0].click()
+                            print("  Clicked 'Do this later' anchor (href fallback, element.click).")
+                        except Exception:
+                            print("  Found 'Do this later' anchor but could not click it.")
                     time.sleep(1)
                     return True
-            except Exception:
-                pass
+        except Exception:
+            pass
         return False
+
+    home_page_default = "https://github.com"
+    privacy_default = "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement"
+    terms_default = "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service"
+    domain_default = "github.com"
+
+    website_config_file = "website_config"
+    home_page_url = home_page_default
+    privacy_url = privacy_default
+    terms_url = terms_default
+    domain_value = domain_default
+
+    try:
+        with open(website_config_file, "r", encoding="utf-8") as wf:
+            for ln in wf:
+                ln = ln.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                        v = v[1:-1]
+                    if k == "home":
+                        home_page_url = v or home_page_default
+                    elif k == "privacy":
+                        privacy_url = v or privacy_default
+                    elif k == "terms":
+                        terms_url = v or terms_default
+                    elif k == "domain":
+                        domain_value = v or domain_default
+        print(f"  website_config loaded: home={home_page_url}, privacy={privacy_url}, terms={terms_url}, domain={domain_value}")
+    except FileNotFoundError:
+        print("  website_config not found, using defaults for home/privacy/terms/domain.")
+    except Exception as e:
+        print(f"  Error reading website_config: {e}. Using defaults.")
 
     outcome = "UNKNOWN"
     driver.get(LOGIN_URL)
 
     email_field = wait_for_visible_input(driver, "email", EMAIL_INPUT_SELECTOR)
     if not email_field:
+        print("  Could not find email field.")
         return "ERROR (no email field)"
     try:
         email_field.clear()
@@ -513,10 +686,12 @@ def attempt_login(driver, email, password):
     time.sleep(1)
 
     if not click_next_button(driver):
+        print("  Could not find a Next button after entering email.")
         return "ERROR (no next button, step 1)"
 
     password_field = wait_for_visible_input(driver, "password", PASSWORD_INPUT_SELECTOR)
     if not password_field:
+        print("  Could not find password field (maybe email step failed).")
         return "FAILED (bad email or no password step)"
     try:
         password_field.clear()
@@ -526,6 +701,7 @@ def attempt_login(driver, email, password):
     time.sleep(3)
 
     if not click_next_button(driver):
+        print("  Could not find a Next/Sign-in button after entering password.")
         return "ERROR (no next button, step 2)"
 
     try:
@@ -533,19 +709,38 @@ def attempt_login(driver, email, password):
             EC.element_to_be_clickable((By.XPATH, "//span[@jsname='V67aGc' and normalize-space(.)='I understand']"))
         )
         driver.execute_script("arguments[0].click();", iunder)
+        print("  Clicked 'I understand' (by jsname).")
         time.sleep(1)
     except Exception:
-        pass
+        try:
+            iunder = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable((By.XPATH, "//span[normalize-space(.)='I understand']"))
+            )
+            driver.execute_script("arguments[0].click();", iunder)
+            print("  Clicked 'I understand' (by text).")
+            time.sleep(1)
+        except Exception:
+            pass
 
     try:
         if click_remind_me_later(timeout=3):
-            pass
+            print("  Handled 'Remind me later' after interstitial.")
     except Exception:
         pass
 
     try:
         if click_do_this_later(timeout=4):
-            pass
+            print("  Handled 'Do this later' link.")
+    except Exception:
+        pass
+
+    outcome = check_outcome(driver)
+    print(f"  Outcome: {outcome} | Current URL: {driver.current_url}")
+
+    try:
+        driver.get(LOGIN_URL)
+        outcome = check_outcome(driver)
+        print(f"  Retry outcome: {outcome} | Current URL: {driver.current_url}")
     except Exception:
         pass
 
@@ -557,15 +752,23 @@ def attempt_login(driver, email, password):
                 EC.presence_of_element_located(CONSENT_CHECKBOX_SELECTOR)
             )
             driver.execute_script("arguments[0].click();", checkbox)
+            print("  Clicked consent checkbox.")
             time.sleep(1)
 
             agree_btn = WebDriverWait(driver, 3).until(
                 EC.presence_of_element_located((By.XPATH, AGREE_BUTTON_XPATH))
             )
             driver.execute_script("arguments[0].click();", agree_btn)
+            print("  Clicked Agree and continue.")
             time.sleep(3)
         except Exception:
-            pass
+            print("  No consent checkbox/dialog appeared, skipping.")
+
+    try:
+        if click_remind_me_later(timeout=3):
+            print("  Handled 'Remind me later' after consent checkbox (if present).")
+    except Exception:
+        pass
 
     try:
         print("  Starting email batch share flow after successful login.")
@@ -578,8 +781,9 @@ def attempt_login(driver, email, password):
                 )
             )
             driver.execute_script("arguments[0].scrollIntoView(true); arguments[0].click();", template_img)
+            print("  Clicked the Resume template image.")
         except Exception:
-            pass
+            print("  Resume template image not found; continuing.")
 
         time.sleep(25)
 
@@ -587,7 +791,8 @@ def attempt_login(driver, email, password):
             if not click_google_docs_share_button(driver):
                 print("  Sharing flow aborted: share button not clickable from live DOM.")
                 return outcome
-        except Exception:
+        except Exception as e:
+            print(f"  Share button click wrapper raised exception: {e}")
             raise
 
         time.sleep(10)
@@ -604,23 +809,13 @@ def attempt_login(driver, email, password):
 def main():
     load_config_and_emails()
 
-    creds = []
-    try:
-        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or "|" not in line:
-                    continue
-                email, password = line.split("|", 1)
-                creds.append((email.strip(), password.strip()))
-    except FileNotFoundError:
-        print(f"{CREDENTIALS_FILE} not found.")
-        return
-    except Exception as e:
-        print(f"Error reading credentials: {e}")
-        return
-
+    creds = load_credentials(CREDENTIALS_FILE)
     print(f"Loaded {len(creds)} credential pairs from {CREDENTIALS_FILE}")
+
+    print("Launching Chrome ...")
+
+    download_dir = DOWNLOAD_DIR if 'DOWNLOAD_DIR' in globals() else os.getcwd()
+    os.makedirs(download_dir, exist_ok=True)
 
     chrome_options = ChromeOptions()
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -629,7 +824,7 @@ def main():
     chrome_options.add_argument("--guest")
 
     prefs = {
-        "download.default_directory": DOWNLOAD_DIR,
+        "download.default_directory": download_dir,
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
         "profile.default_content_settings.popups": 0,
@@ -637,12 +832,14 @@ def main():
     }
     chrome_options.add_experimental_option("prefs", prefs)
 
+    print("Chrome options prepared. Starting login attempts ...")
     results = []
 
-    driver = None
     try:
+        driver = None
         for i, (email, password) in enumerate(creds, 1):
             print(f"[{i}/{len(creds)}] Testing {email} ...")
+
             try:
                 driver = webdriver.Chrome(options=chrome_options)
                 try:
@@ -653,10 +850,25 @@ def main():
                 except Exception:
                     pass
 
-                outcome = attempt_login(driver, email, password)
+                try:
+                    driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+                        "behavior": "allow",
+                        "downloadPath": download_dir
+                    })
+                except Exception as e:
+                    print(f"  Warning: Page.setDownloadBehavior failed: {e}")
+
+                try:
+                    outcome = attempt_login(driver, email, password)
+                except Exception as e:
+                    print(f"  attempt_login raised an exception for {email}: {e}")
+                    traceback.print_exc()
+                    outcome = "ERROR"
+
             except Exception as e:
-                print(f"  attempt_login raised: {e}")
+                print(f"  Could not start Chrome for {email}: {e}")
                 outcome = "ERROR"
+
             finally:
                 try:
                     if driver is not None:
@@ -667,13 +879,14 @@ def main():
 
             print(f"  -> {outcome}")
             results.append((email, outcome))
+
             time.sleep(DELAY_BETWEEN_ATTEMPTS)
     finally:
-        if driver is not None:
-            try:
+        try:
+            if 'driver' in locals() and driver is not None:
                 driver.quit()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     with open(RESULTS_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
