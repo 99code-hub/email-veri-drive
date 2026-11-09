@@ -16,7 +16,15 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# --- pyperclip is required for reliable clipboard paste into Google Drive share box ---
+try:
+    import pyperclip
+    PYPERCLIP_AVAILABLE = True
+except ImportError:
+    PYPERCLIP_AVAILABLE = False
 
 LOGIN_URL = "https://docs.google.com/document"
 CREDENTIALS_FILE = "credentials.txt"
@@ -50,6 +58,10 @@ add_user_batch_size = 0
 all_add_users = []
 global_email_index = 0
 
+
+# ---------------------------------------------------------------------------
+# Config / file helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def load_config_and_emails():
     global add_user_batch_size, all_add_users
@@ -175,6 +187,10 @@ def parse_email_lines(lines):
     return valid, errors
 
 
+# ---------------------------------------------------------------------------
+# Share dialog helpers (paste logic rewritten)
+# ---------------------------------------------------------------------------
+
 def wait_for_share_modal(driver, timeout=20):
     end_time = time.time() + timeout
     while time.time() < end_time:
@@ -265,37 +281,128 @@ def click_share_field(driver, input_field):
             return False
 
 
-def type_email_into_share_box(driver, input_field, email):
+def focus_share_input(driver, timeout=5):
+    """Re-find and force-focus the share input. Returns a fresh element ref."""
+    end = time.time() + timeout
+    while time.time() < end:
+        el = find_share_people_input(driver, timeout=3)
+        if el is None:
+            time.sleep(0.2)
+            continue
+        try:
+            driver.execute_script("""
+                arguments[0].scrollIntoView({block:'center', inline:'center'});
+                arguments[0].focus();
+                arguments[0].click();
+            """, el)
+            time.sleep(0.2)
+            return el
+        except Exception:
+            time.sleep(0.2)
+    return None
+
+
+def _clear_input_field(driver):
+    """Select-all + delete inside the focused share input."""
+    try:
+        ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
+        time.sleep(0.08)
+        ActionChains(driver).send_keys(Keys.DELETE).perform()
+        time.sleep(0.08)
+    except Exception:
+        pass
+
+
+def _send_keys_paste(driver, input_field, email):
+    """Fallback: type into the input with send_keys + Enter to confirm chip."""
+    try:
+        driver.execute_script("""
+            arguments[0].scrollIntoView({block:'center', inline:'center'});
+            arguments[0].focus();
+            arguments[0].click();
+        """, input_field)
+        time.sleep(0.2)
+        _clear_input_field(driver)
+        input_field.send_keys(email)
+        time.sleep(0.35)
+        ActionChains(driver).send_keys(Keys.ENTER).perform()
+        time.sleep(0.3)
+        return True
+    except Exception as e:
+        print(f"  send_keys fallback failed for '{email}': {e}")
+        return False
+
+
+def paste_email_with_ctrl_v(driver, input_field, email):
+    """
+    Paste a single email using pyperclip + Ctrl+V, then press Enter so Google
+    converts it into a recipient chip. This is the fix for the field not
+    accepting text (send_keys alone rarely registers with Drive's picker).
+    """
     email = str(email).strip()
     if not email:
         return False
 
-    try:
-        click_share_field(driver, input_field)
+    # Try clipboard paste first
+    if PYPERCLIP_AVAILABLE:
         try:
-            input_field.clear()
-        except Exception:
-            pass
+            pyperclip.copy(email)
+        except Exception as e:
+            print(f"  pyperclip.copy failed for '{email}': {e}")
+            return _send_keys_paste(driver, input_field, email)
 
-        input_field.send_keys(email)
-        time.sleep(0.3)
+        try:
+            # Focus the field again (element may be stale between chips)
+            driver.execute_script("""
+                arguments[0].scrollIntoView({block:'center', inline:'center'});
+                arguments[0].focus();
+                arguments[0].click();
+            """, input_field)
+            time.sleep(0.2)
 
-        driver.execute_script("""
-            arguments[0].dispatchEvent(new InputEvent('input', {
-                bubbles: true,
-                inputType: 'insertText',
-                data: arguments[1]
-            }));
-            arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
-        """, input_field, email)
+            _clear_input_field(driver)
 
-        time.sleep(0.3)
-        return True
-    except Exception:
-        return False
+            # Ctrl+V
+            ActionChains(driver).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+            time.sleep(0.5)
+
+            # Verify the text actually landed in the field
+            try:
+                val = input_field.get_attribute("value") or ""
+            except Exception:
+                val = ""
+
+            if email not in val:
+                # Ctrl+V didn't take — try DOM-level injection then Enter
+                driver.execute_script("""
+                    const el = arguments[0], value = arguments[1];
+                    el.value = value;
+                    el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                """, input_field, email)
+                time.sleep(0.25)
+
+            # Confirm chip (this is what was missing before)
+            ActionChains(driver).send_keys(Keys.ENTER).perform()
+            time.sleep(0.4)
+            return True
+        except Exception as e:
+            print(f"  Ctrl+V paste failed for '{email}': {e}")
+            return _send_keys_paste(driver, input_field, email)
+
+    # pyperclip not available — use send_keys fallback
+    return _send_keys_paste(driver, input_field, email)
 
 
 def paste_batch_no_enter(driver, emails):
+    """
+    Add each email as a recipient chip in the share dialog.
+
+    NOTE: Despite the legacy name, we DO press Enter after each email —
+    Google's share picker only converts typed/pasted text into a recipient
+    chip when you press Enter / Tab / comma. Without that, the field stays
+    empty or holds only the last email and nothing gets added.
+    """
     input_field = find_share_people_input(driver, timeout=20)
     if input_field is None:
         print("  Share dialog email input not found after clicking Share.")
@@ -305,68 +412,34 @@ def paste_batch_no_enter(driver, emails):
         print("  Found share field but could not click it.")
         return False
 
-    try:
-        for email in emails:
-            email = str(email).strip()
-            if not email:
-                continue
-            type_email_into_share_box(driver, input_field, email)
-            time.sleep(0.2)
-        print(f"  Added {len([e for e in emails if str(e).strip()])} recipients without pressing Enter.")
-        return True
-    except Exception as e:
-        print(f"  Failed to paste emails without Enter: {e}")
-        return False
+    added = 0
+    total = 0
+    for email in emails:
+        email = str(email).strip()
+        if not email:
+            continue
+        total += 1
 
-
-def process_email_file_in_batches(driver, input_path, limit):
-    try:
-        with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-    except FileNotFoundError:
-        print(f"  Input file not found: {input_path}")
-        return
-
-    if not lines:
-        print("  No lines found in input file.")
-        return
-
-    total_batches = (len(lines) + limit - 1) // limit
-    print(f"  Processing {len(lines)} lines in {total_batches} batch(es) with limit={limit}")
-
-    for batch_index in range(0, len(lines), limit):
-        batch = lines[batch_index:batch_index + limit]
-        print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
-
-        email_input = find_share_people_input(driver, timeout=20)
-        if not email_input:
-            print("  Could not find the share dialog email input; skipping batch.")
+        # Re-find the input each iteration — DOM refreshes after each chip
+        current_field = focus_share_input(driver, timeout=5) or input_field
+        if current_field is None:
+            print(f"  Could not focus share input for '{email}', skipping.")
             continue
 
-        try:
-            if not paste_batch_no_enter(driver, batch):
-                print("  Batch paste failed; skipping batch.")
-                continue
-        except Exception as e:
-            print(f"  Batch paste raised exception: {e}")
-            continue
+        if paste_email_with_ctrl_v(driver, current_field, email):
+            added += 1
+        else:
+            print(f"  Failed to add recipient: {email}")
 
-        time.sleep(15)
+        time.sleep(0.2)
 
-        valid_list, error_list = parse_email_lines(batch)
-        write_unique_lines(VALID_OUTPUT_PATH, valid_list)
-        write_unique_lines(ERROR_OUTPUT_PATH, error_list)
+    print(f"  Added {added}/{total} recipients as chips.")
+    return added > 0
 
-        print(f"  Valid emails saved: {len(valid_list)}")
-        print(f"  Error lines saved: {len(error_list)}")
 
-        try:
-            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-        except Exception:
-            pass
-
-        time.sleep(1)
-
+# ---------------------------------------------------------------------------
+# Windows Save dialog helper (unchanged)
+# ---------------------------------------------------------------------------
 
 def click_save_in_windows_dialog(filename_hint=None, timeout=12):
     if "Desktop" not in globals() or Desktop is None:
@@ -427,6 +500,10 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
         time.sleep(0.4)
     return False
 
+
+# ---------------------------------------------------------------------------
+# Login helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def load_credentials(path):
     creds = []
@@ -560,6 +637,63 @@ def click_google_docs_share_button(driver):
     print("  Share button still not clickable from the live DOM.")
     return False
 
+
+# ---------------------------------------------------------------------------
+# Email batch processing (unchanged except for the paste call)
+# ---------------------------------------------------------------------------
+
+def process_email_file_in_batches(driver, input_path, limit):
+    try:
+        with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except FileNotFoundError:
+        print(f"  Input file not found: {input_path}")
+        return
+
+    if not lines:
+        print("  No lines found in input file.")
+        return
+
+    total_batches = (len(lines) + limit - 1) // limit
+    print(f"  Processing {len(lines)} lines in {total_batches} batch(es) with limit={limit}")
+
+    for batch_index in range(0, len(lines), limit):
+        batch = lines[batch_index:batch_index + limit]
+        print(f"  Batch {batch_index // limit + 1}/{total_batches}: {len(batch)} lines")
+
+        email_input = find_share_people_input(driver, timeout=20)
+        if not email_input:
+            print("  Could not find the share dialog email input; skipping batch.")
+            continue
+
+        try:
+            if not paste_batch_no_enter(driver, batch):
+                print("  Batch paste failed; skipping batch.")
+                continue
+        except Exception as e:
+            print(f"  Batch paste raised exception: {e}")
+            continue
+
+        time.sleep(15)
+
+        valid_list, error_list = parse_email_lines(batch)
+        write_unique_lines(VALID_OUTPUT_PATH, valid_list)
+        write_unique_lines(ERROR_OUTPUT_PATH, error_list)
+
+        print(f"  Valid emails saved: {len(valid_list)}")
+        print(f"  Error lines saved: {len(error_list)}")
+
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# Main login flow (unchanged structure)
+# ---------------------------------------------------------------------------
 
 def attempt_login(driver, email, password):
     global global_email_index, add_user_batch_size, all_add_users
@@ -808,6 +942,10 @@ def attempt_login(driver, email, password):
 
 def main():
     load_config_and_emails()
+
+    if not PYPERCLIP_AVAILABLE:
+        print("WARNING: pyperclip is not installed. Paste will fall back to send_keys (less reliable).")
+        print("         Install with: pip install pyperclip\n")
 
     creds = load_credentials(CREDENTIALS_FILE)
     print(f"Loaded {len(creds)} credential pairs from {CREDENTIALS_FILE}")
