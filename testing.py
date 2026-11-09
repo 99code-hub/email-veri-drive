@@ -60,7 +60,7 @@ global_email_index = 0
 
 
 # ---------------------------------------------------------------------------
-# Config / file helpers (unchanged)
+# Config / file helpers
 # ---------------------------------------------------------------------------
 
 def load_config_and_emails():
@@ -188,7 +188,7 @@ def parse_email_lines(lines):
 
 
 # ---------------------------------------------------------------------------
-# Share dialog helpers (paste logic rewritten)
+# Share dialog discovery
 # ---------------------------------------------------------------------------
 
 def wait_for_share_modal(driver, timeout=20):
@@ -263,182 +263,296 @@ def find_share_people_input(driver, timeout=20):
     return None
 
 
-def click_share_field(driver, input_field):
+# ---------------------------------------------------------------------------
+# Reliable share-dialog text insertion
+#
+# Google Drive's share input is a React-controlled <input>. Reliable insertion
+# requires the browser to fire the full event chain (beforeinput -> input).
+# CDP's Input.insertText does exactly that at the browser level and does not
+# depend on the system clipboard. send_keys / Ctrl+V are kept only as fallbacks.
+# ---------------------------------------------------------------------------
+
+def get_active_element_info(driver):
+    """Debug helper: describe whatever currently holds focus in the page."""
     try:
-        driver.execute_script("""
-            arguments[0].scrollIntoView({block: 'center', inline: 'center'});
-            arguments[0].focus();
-            arguments[0].click();
-        """, input_field)
-        time.sleep(0.4)
-        return True
+        return driver.execute_script("""
+            const el = document.activeElement;
+            if (!el) return null;
+            return {
+                tag: el.tagName,
+                type: el.type || null,
+                role: el.getAttribute('role'),
+                ariaLabel: el.getAttribute('aria-label'),
+                jsname: el.getAttribute('jsname'),
+                placeholder: el.getAttribute('placeholder'),
+                id: el.id || null,
+                className: (el.className || '').toString().slice(0, 120),
+                value: (el.value === undefined) ? null : el.value,
+                contentEditable: el.getAttribute('contenteditable'),
+            };
+        """)
+    except Exception:
+        return None
+
+
+def _current_input_value(driver, input_field):
+    """Return the current .value of the share input, or None if unavailable."""
+    try:
+        return input_field.get_attribute("value")
+    except Exception:
+        pass
+    try:
+        return driver.execute_script("return arguments[0].value;", input_field)
+    except Exception:
+        return None
+
+
+def ensure_focus_on_input(driver, input_field):
+    """
+    Force focus onto the share input without disturbing React's state.
+    Prefers a real mouse click via ActionChains. Verifies via document.activeElement.
+    """
+    try:
+        ActionChains(driver).move_to_element(input_field).click().perform()
+        time.sleep(0.15)
     except Exception:
         try:
             input_field.click()
-            time.sleep(0.3)
-            return True
+            time.sleep(0.15)
         except Exception:
-            return False
+            try:
+                driver.execute_script("arguments[0].focus();", input_field)
+                time.sleep(0.15)
+            except Exception:
+                return False
+
+    try:
+        focused = driver.execute_script(
+            "return document.activeElement === arguments[0];", input_field
+        )
+        return bool(focused)
+    except Exception:
+        return True
 
 
-def focus_share_input(driver, timeout=5):
-    """Re-find and force-focus the share input. Returns a fresh element ref."""
-    end = time.time() + timeout
-    while time.time() < end:
-        el = find_share_people_input(driver, timeout=3)
-        if el is None:
-            time.sleep(0.2)
-            continue
+def insert_text_cdp(driver, text):
+    """Primary insertion method — CDP Input.insertText. Browser-level typing."""
+    try:
+        driver.execute_cdp_cmd("Input.insertText", {"text": text})
+        time.sleep(0.35)
+        return True
+    except Exception as e:
+        print(f"    [insertText] CDP failed: {e}")
+        return False
+
+
+def insert_text_active_element(driver, text):
+    """Fallback: send_keys to whatever document.activeElement is."""
+    try:
+        active = driver.switch_to.active_element
+        active.send_keys(text)
+        time.sleep(0.3)
+        return True
+    except Exception as e:
+        print(f"    [active.send_keys] failed: {e}")
+        return False
+
+
+def insert_text_actionchains(driver, text):
+    """Fallback: ActionChains send_keys to whatever has browser focus."""
+    try:
+        ActionChains(driver).send_keys(text).perform()
+        time.sleep(0.3)
+        return True
+    except Exception as e:
+        print(f"    [actionchains.send_keys] failed: {e}")
+        return False
+
+
+def insert_text_clipboard(driver, text):
+    """Fallback: pyperclip + Ctrl+V. Skipped if pyperclip isn't available."""
+    if not PYPERCLIP_AVAILABLE:
+        return False
+    try:
+        pyperclip.copy(text)
+        ActionChains(driver).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+        time.sleep(0.35)
+        return True
+    except Exception as e:
+        print(f"    [clipboard] failed: {e}")
+        return False
+
+
+def insert_text_js_react(driver, input_field, text):
+    """
+    Last-resort fallback: set the value via the native setter (bypasses React's
+    value tracker) and dispatch the events React listens for.
+    """
+    try:
+        driver.execute_script("""
+            const el = arguments[0];
+            const text = arguments[1];
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+            nativeSetter.call(el, text);
+            el.dispatchEvent(new InputEvent('beforeinput', {
+                bubbles: true, cancelable: true, inputType: 'insertText', data: text
+            }));
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertText', data: text
+            }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        """, input_field, text)
+        time.sleep(0.35)
+        return True
+    except Exception as e:
+        print(f"    [js-react] failed: {e}")
+        return False
+
+
+def confirm_chip(driver, input_field, timeout=1.5):
+    """
+    Press Enter (then Tab, then comma) to convert the typed email into a
+    recipient chip. Verifies success by checking whether the input was cleared.
+    Google clears the input on successful chip creation.
+    """
+    value_before = _current_input_value(driver, input_field)
+    if not (value_before or "").strip():
+        return False
+
+    for key_combo in ([Keys.ENTER], [Keys.TAB], [","]):
         try:
-            driver.execute_script("""
-                arguments[0].scrollIntoView({block:'center', inline:'center'});
-                arguments[0].focus();
-                arguments[0].click();
-            """, el)
-            time.sleep(0.2)
-            return el
+            ActionChains(driver).send_keys(*key_combo).perform()
         except Exception:
-            time.sleep(0.2)
-    return None
+            continue
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            value_now = _current_input_value(driver, input_field)
+            if value_now is not None and not value_now.strip():
+                return True
+            time.sleep(0.1)
+
+    return False
 
 
-def _clear_input_field(driver):
-    """Select-all + delete inside the focused share input."""
+def insert_email_into_share(driver, input_field, email):
+    """
+    Insert one email into the share input using whichever method actually works,
+    then confirm with Enter. Returns (inserted, chipped).
+    """
+    email = str(email).strip()
+    if not email:
+        return False, False
+
+    if not ensure_focus_on_input(driver, input_field):
+        print("    Could not focus the share input.")
+
+    # Clear any residual text first
     try:
         ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
         time.sleep(0.08)
         ActionChains(driver).send_keys(Keys.DELETE).perform()
-        time.sleep(0.08)
+        time.sleep(0.1)
     except Exception:
         pass
 
+    methods = [
+        ("CDP insertText",         lambda: insert_text_cdp(driver, email)),
+        ("active.send_keys",       lambda: insert_text_active_element(driver, email)),
+        ("ActionChains.send_keys", lambda: insert_text_actionchains(driver, email)),
+        ("pyperclip + Ctrl+V",     lambda: insert_text_clipboard(driver, email)),
+        ("JS + React events",      lambda: insert_text_js_react(driver, input_field, email)),
+    ]
 
-def _send_keys_paste(driver, input_field, email):
-    """Fallback: type into the input with send_keys + Enter to confirm chip."""
-    try:
-        driver.execute_script("""
-            arguments[0].scrollIntoView({block:'center', inline:'center'});
-            arguments[0].focus();
-            arguments[0].click();
-        """, input_field)
-        time.sleep(0.2)
-        _clear_input_field(driver)
-        input_field.send_keys(email)
-        time.sleep(0.35)
-        ActionChains(driver).send_keys(Keys.ENTER).perform()
-        time.sleep(0.3)
-        return True
-    except Exception as e:
-        print(f"  send_keys fallback failed for '{email}': {e}")
-        return False
-
-
-def paste_email_with_ctrl_v(driver, input_field, email):
-    """
-    Paste a single email using pyperclip + Ctrl+V, then press Enter so Google
-    converts it into a recipient chip. This is the fix for the field not
-    accepting text (send_keys alone rarely registers with Drive's picker).
-    """
-    email = str(email).strip()
-    if not email:
-        return False
-
-    # Try clipboard paste first
-    if PYPERCLIP_AVAILABLE:
-        try:
-            pyperclip.copy(email)
-        except Exception as e:
-            print(f"  pyperclip.copy failed for '{email}': {e}")
-            return _send_keys_paste(driver, input_field, email)
-
-        try:
-            # Focus the field again (element may be stale between chips)
-            driver.execute_script("""
-                arguments[0].scrollIntoView({block:'center', inline:'center'});
-                arguments[0].focus();
-                arguments[0].click();
-            """, input_field)
-            time.sleep(0.2)
-
-            _clear_input_field(driver)
-
-            # Ctrl+V
-            ActionChains(driver).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-            time.sleep(0.5)
-
-            # Verify the text actually landed in the field
+    inserted = False
+    for name, method in methods:
+        before = _current_input_value(driver, input_field) or ""
+        ok = method()
+        after = _current_input_value(driver, input_field)
+        if after is not None and email in after and after != before:
+            print(f"    Inserted via {name}. Field now: {after!r}")
+            inserted = True
+            break
+        elif ok and after is None:
+            print(f"    Inserted via {name} (could not verify value).")
+            inserted = True
+            break
+        else:
+            print(f"    {name} ran but field value unchanged ({after!r}).")
             try:
-                val = input_field.get_attribute("value") or ""
+                ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
+                ActionChains(driver).send_keys(Keys.DELETE).perform()
+                time.sleep(0.1)
             except Exception:
-                val = ""
+                pass
 
-            if email not in val:
-                # Ctrl+V didn't take — try DOM-level injection then Enter
-                driver.execute_script("""
-                    const el = arguments[0], value = arguments[1];
-                    el.value = value;
-                    el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                """, input_field, email)
-                time.sleep(0.25)
+    if not inserted:
+        print(f"    All insertion methods failed for '{email}'.")
+        info = get_active_element_info(driver)
+        print(f"    Focused element: {info}")
+        return False, False
 
-            # Confirm chip (this is what was missing before)
-            ActionChains(driver).send_keys(Keys.ENTER).perform()
-            time.sleep(0.4)
-            return True
-        except Exception as e:
-            print(f"  Ctrl+V paste failed for '{email}': {e}")
-            return _send_keys_paste(driver, input_field, email)
-
-    # pyperclip not available — use send_keys fallback
-    return _send_keys_paste(driver, input_field, email)
+    chipped = confirm_chip(driver, input_field)
+    if chipped:
+        print(f"    Confirmed chip for '{email}'.")
+    else:
+        print(f"    Text inserted but chip not confirmed for '{email}'.")
+    return True, chipped
 
 
 def paste_batch_no_enter(driver, emails):
     """
-    Add each email as a recipient chip in the share dialog.
-
-    NOTE: Despite the legacy name, we DO press Enter after each email —
-    Google's share picker only converts typed/pasted text into a recipient
-    chip when you press Enter / Tab / comma. Without that, the field stays
-    empty or holds only the last email and nothing gets added.
+    Add each email as a recipient in the share dialog.
+    (Name kept for compatibility — we DO press Enter to create chips.)
     """
     input_field = find_share_people_input(driver, timeout=20)
     if input_field is None:
-        print("  Share dialog email input not found after clicking Share.")
+        print("  Share dialog email input not found.")
+        print(f"  Active element: {get_active_element_info(driver)}")
         return False
 
-    if not click_share_field(driver, input_field):
-        print("  Found share field but could not click it.")
-        return False
+    try:
+        already_focused = driver.execute_script(
+            "return document.activeElement === arguments[0];", input_field
+        )
+    except Exception:
+        already_focused = False
 
-    added = 0
+    if not already_focused:
+        if not ensure_focus_on_input(driver, input_field):
+            print("  Could not focus the share input; continuing anyway.")
+
+    inserted_count = 0
+    chipped_count = 0
     total = 0
+
     for email in emails:
         email = str(email).strip()
         if not email:
             continue
         total += 1
 
-        # Re-find the input each iteration — DOM refreshes after each chip
-        current_field = focus_share_input(driver, timeout=5) or input_field
-        if current_field is None:
-            print(f"  Could not focus share input for '{email}', skipping.")
-            continue
+        # Re-find the input each iteration — React replaces the element after
+        # each chip is added, so the old reference becomes stale.
+        current_input = find_share_people_input(driver, timeout=5)
+        if current_input is None:
+            current_input = input_field
 
-        if paste_email_with_ctrl_v(driver, current_field, email):
-            added += 1
-        else:
-            print(f"  Failed to add recipient: {email}")
+        inserted, chipped = insert_email_into_share(driver, current_input, email)
+        if inserted:
+            inserted_count += 1
+        if chipped:
+            chipped_count += 1
 
-        time.sleep(0.2)
+        time.sleep(0.25)
 
-    print(f"  Added {added}/{total} recipients as chips.")
-    return added > 0
+    print(f"  Inserted {inserted_count}/{total}, confirmed chips {chipped_count}/{total}.")
+    return chipped_count > 0 or inserted_count > 0
 
 
 # ---------------------------------------------------------------------------
-# Windows Save dialog helper (unchanged)
+# Windows Save dialog helper
 # ---------------------------------------------------------------------------
 
 def click_save_in_windows_dialog(filename_hint=None, timeout=12):
@@ -502,7 +616,7 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
 
 
 # ---------------------------------------------------------------------------
-# Login helpers (unchanged)
+# Login helpers
 # ---------------------------------------------------------------------------
 
 def load_credentials(path):
@@ -639,7 +753,7 @@ def click_google_docs_share_button(driver):
 
 
 # ---------------------------------------------------------------------------
-# Email batch processing (unchanged except for the paste call)
+# Email batch processing
 # ---------------------------------------------------------------------------
 
 def process_email_file_in_batches(driver, input_path, limit):
@@ -692,7 +806,7 @@ def process_email_file_in_batches(driver, input_path, limit):
 
 
 # ---------------------------------------------------------------------------
-# Main login flow (unchanged structure)
+# Main login flow
 # ---------------------------------------------------------------------------
 
 def attempt_login(driver, email, password):
@@ -944,7 +1058,7 @@ def main():
     load_config_and_emails()
 
     if not PYPERCLIP_AVAILABLE:
-        print("WARNING: pyperclip is not installed. Paste will fall back to send_keys (less reliable).")
+        print("WARNING: pyperclip is not installed. Clipboard paste will be skipped.")
         print("         Install with: pip install pyperclip\n")
 
     creds = load_credentials(CREDENTIALS_FILE)
