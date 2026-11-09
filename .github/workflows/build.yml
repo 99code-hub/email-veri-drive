@@ -46,7 +46,7 @@ jobs:
 
       - name: Verify runtime imports (pre-build sanity check)
         run: |
-          python -c "import pyperclip, selenium; print('pyperclip', pyperclip.__version__ if hasattr(pyperclip,'__version__') else 'ok'); print('selenium', selenium.__version__)"
+          python -c "import pyperclip, selenium; print('pyperclip ok'); print('selenium', selenium.__version__)"
 
       - name: Ensure PyInstaller spec exists
         run: |
@@ -61,50 +61,76 @@ jobs:
 
       - name: Verify EXE was produced
         run: |
-          if (-not (Test-Path "dist/${{ env.APP_NAME }}.exe")) {
+          if (-not (Test-Path "dist\${{ env.APP_NAME }}.exe")) {
             Write-Error "dist/${{ env.APP_NAME }}.exe was not produced."
             exit 1
           }
-          $exe = Get-Item "dist/${{ env.APP_NAME }}.exe"
+          $exe = Get-Item "dist\${{ env.APP_NAME }}.exe"
           Write-Host "EXE size: $([math]::Round($exe.Length / 1MB, 2)) MB"
           if ($exe.Length -lt 1MB) {
             Write-Error "EXE is suspiciously small ($($exe.Length) bytes) — build likely failed."
             exit 1
           }
 
-      - name: Smoke test EXE (headless import check)
-        # Launch the frozen EXE with a timeout so we confirm it starts without
-        # immediately crashing on a missing dependency (e.g. pyperclip).
-        # The script's own `finally: input()` waits for Enter, so we pipe one in
-        # and kill after 20s regardless.
+      - name: Smoke test EXE (launch + timeout)
         timeout-minutes: 2
         run: |
+          $logDir = "smoke-test-logs"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+          $stdinFile  = Join-Path $logDir "stdin.txt"
+          $stdoutFile = Join-Path $logDir "stdout.txt"
+          $stderrFile = Join-Path $logDir "stderr.txt"
+
+          # 1. Start-Process requires the stdin file to EXIST before it is invoked.
+          #    Creating it first is what the previous version got wrong.
+          "" | Out-File -FilePath $stdinFile -Encoding ASCII
+
+          # 2. Prevent the EXE from launching a real Chrome session during CI.
+          #    With no credentials.txt the script fails fast on load_credentials(),
+          #    which is exactly what we want to exercise here (it proves imports
+          #    resolved before hitting the missing-file error).
+          if (Test-Path "credentials.txt") {
+            Write-Host "Temporarily moving credentials.txt aside for smoke test."
+            Rename-Item "credentials.txt" "credentials.txt.skipped" -Force
+          }
+
           $proc = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" `
-                                -RedirectStandardInput "$env:TEMP\stdin.txt" `
-                                -RedirectStandardOutput "$env:TEMP\exe_stdout.txt" `
-                                -RedirectStandardError  "$env:TEMP\exe_stderr.txt" `
+                                -RedirectStandardInput  $stdinFile `
+                                -RedirectStandardOutput $stdoutFile `
+                                -RedirectStandardError  $stderrFile `
                                 -PassThru
-          "" | Out-File -FilePath "$env:TEMP\stdin.txt" -Encoding ASCII
-          Start-Sleep -Seconds 15
-          if ($proc.HasExited) {
-            $code = $proc.ExitCode
-            Write-Host "EXE exited early with code $code (expected — it may fail to find config)."
-          } else {
-            Write-Host "EXE still running after 15s — killing."
+
+          Start-Sleep -Seconds 10
+
+          if (-not $proc.HasExited) {
+            Write-Host "EXE still running after 10s — killing (expected: waits on input())."
             Stop-Process -Id $proc.Id -Force
+          } else {
+            Write-Host "EXE exited with code $($proc.ExitCode)."
           }
+
           Write-Host "----- stdout -----"
-          if (Test-Path "$env:TEMP\exe_stdout.txt") { Get-Content "$env:TEMP\exe_stdout.txt" }
+          if (Test-Path $stdoutFile) { Get-Content $stdoutFile }
           Write-Host "----- stderr -----"
-          if (Test-Path "$env:TEMP\exe_stderr.txt") { Get-Content "$env:TEMP\exe_stderr.txt" }
-          # Fail the job if stderr clearly shows an ImportError / ModuleNotFoundError
-          if (Test-Path "$env:TEMP\exe_stderr.txt") {
-            $err = Get-Content "$env:TEMP\exe_stderr.txt" -Raw
-            if ($err -match "ModuleNotFoundError|ImportError") {
-              Write-Error "EXE crashed with a missing module at runtime:`n$err"
-              exit 1
-            }
+          if (Test-Path $stderrFile) { Get-Content $stderrFile }
+
+          # 3. Fail the job only on the failure mode we actually care about:
+          #    a missing bundled module (e.g. pyperclip not collected by PyInstaller).
+          $err = if (Test-Path $stderrFile) { Get-Content $stderrFile -Raw } else { "" }
+          if ($err -and $err -match "ModuleNotFoundError|ImportError|No module named") {
+            Write-Error "EXE crashed with a missing module at runtime:`n$err"
+            exit 1
           }
+          Write-Host "Smoke test passed — no missing-module errors."
+
+      - name: Upload smoke-test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-logs-${{ github.sha }}
+          path: smoke-test-logs/
+          if-no-files-found: ignore
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
@@ -123,6 +149,5 @@ jobs:
             build
             *.spec
             *.log
-            ${{ env.TEMP }}\exe_stdout.txt
-            ${{ env.TEMP }}\exe_stderr.txt
+            smoke-test-logs/
           if-no-files-found: ignore
