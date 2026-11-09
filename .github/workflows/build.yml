@@ -7,6 +7,10 @@ on:
       - main
       - master
 
+env:
+  PYTHON_VERSION: "3.12"
+  APP_NAME: "testing"
+
 jobs:
   build:
     runs-on: windows-latest
@@ -18,42 +22,107 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Upgrade pip
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip wheel setuptools
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          } else {
+            Write-Host "::warning::requirements.txt not found; installing base deps only"
+          }
+          # pyperclip is required by testing.py for the Ctrl+V paste into the Share box
+          pip install pyperclip
           pip install pyinstaller
 
       - name: Show installed packages
         run: |
+          python --version
           pip freeze
+
+      - name: Verify runtime imports (pre-build sanity check)
+        run: |
+          python -c "import pyperclip, selenium; print('pyperclip', pyperclip.__version__ if hasattr(pyperclip,'__version__') else 'ok'); print('selenium', selenium.__version__)"
+
+      - name: Ensure PyInstaller spec exists
+        run: |
+          if (-not (Test-Path testing.spec)) {
+            Write-Error "testing.spec is missing — the build cannot proceed."
+            exit 1
+          }
 
       - name: Build EXE
         run: |
-          pyinstaller --clean testing.spec
+          pyinstaller --clean --noconfirm testing.spec
 
-      - name: List dist folder
+      - name: Verify EXE was produced
         run: |
-          dir dist
+          if (-not (Test-Path "dist/${{ env.APP_NAME }}.exe")) {
+            Write-Error "dist/${{ env.APP_NAME }}.exe was not produced."
+            exit 1
+          }
+          $exe = Get-Item "dist/${{ env.APP_NAME }}.exe"
+          Write-Host "EXE size: $([math]::Round($exe.Length / 1MB, 2)) MB"
+          if ($exe.Length -lt 1MB) {
+            Write-Error "EXE is suspiciously small ($($exe.Length) bytes) — build likely failed."
+            exit 1
+          }
+
+      - name: Smoke test EXE (headless import check)
+        # Launch the frozen EXE with a timeout so we confirm it starts without
+        # immediately crashing on a missing dependency (e.g. pyperclip).
+        # The script's own `finally: input()` waits for Enter, so we pipe one in
+        # and kill after 20s regardless.
+        timeout-minutes: 2
+        run: |
+          $proc = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" `
+                                -RedirectStandardInput "$env:TEMP\stdin.txt" `
+                                -RedirectStandardOutput "$env:TEMP\exe_stdout.txt" `
+                                -RedirectStandardError  "$env:TEMP\exe_stderr.txt" `
+                                -PassThru
+          "" | Out-File -FilePath "$env:TEMP\stdin.txt" -Encoding ASCII
+          Start-Sleep -Seconds 15
+          if ($proc.HasExited) {
+            $code = $proc.ExitCode
+            Write-Host "EXE exited early with code $code (expected — it may fail to find config)."
+          } else {
+            Write-Host "EXE still running after 15s — killing."
+            Stop-Process -Id $proc.Id -Force
+          }
+          Write-Host "----- stdout -----"
+          if (Test-Path "$env:TEMP\exe_stdout.txt") { Get-Content "$env:TEMP\exe_stdout.txt" }
+          Write-Host "----- stderr -----"
+          if (Test-Path "$env:TEMP\exe_stderr.txt") { Get-Content "$env:TEMP\exe_stderr.txt" }
+          # Fail the job if stderr clearly shows an ImportError / ModuleNotFoundError
+          if (Test-Path "$env:TEMP\exe_stderr.txt") {
+            $err = Get-Content "$env:TEMP\exe_stderr.txt" -Raw
+            if ($err -match "ModuleNotFoundError|ImportError") {
+              Write-Error "EXE crashed with a missing module at runtime:`n$err"
+              exit 1
+            }
+          }
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: testing-windows
+          name: ${{ env.APP_NAME }}-windows-${{ github.sha }}
           path: |
-            dist/testing.exe
+            dist/${{ env.APP_NAME }}.exe
+          if-no-files-found: error
 
       - name: Upload build logs (if build fails)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs-${{ github.sha }}
           path: |
             build
             *.spec
             *.log
+            ${{ env.TEMP }}\exe_stdout.txt
+            ${{ env.TEMP }}\exe_stderr.txt
+          if-no-files-found: ignore
