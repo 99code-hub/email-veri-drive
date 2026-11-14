@@ -177,45 +177,122 @@ def parse_email_lines(lines):
 
 
 # ---------------------------------------------------------------------------
-# Share dialog discovery — FIXED
+# Share dialog discovery — BULLETPROOF (Shadow DOM & Iframes)
 # ---------------------------------------------------------------------------
 
 def find_share_people_input(driver, timeout=20):
     """
-    Finds the share dialog input. Uses a JS fallback because Selenium's
-    is_displayed() frequently fails on Material Design animated dialogs.
+    Finds the share dialog input. Uses a recursive JavaScript search to pierce
+    Shadow DOMs, and automatically switches into iframes if the input is not
+    found in the main document context.
     """
     end_time = time.time() + timeout
     while time.time() < end_time:
-        # 1. Try Selenium's native wait (works best if fully rendered)
+        # 1. Try current frame - Selenium
         try:
-            el = WebDriverWait(driver, 1).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "input[jsname='YPqjbf']"))
-            )
-            return el
+            els = driver.find_elements(By.CSS_SELECTOR, "input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']")
+            for el in els:
+                try:
+                    if el.is_displayed():
+                        return el
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # 2. JS fallback (guaranteed to find it based on bounding box, bypassing is_displayed)
+        # 2. Try current frame - JS with Shadow DOM piercing
         try:
             el = driver.execute_script("""
-                const inputs = document.querySelectorAll("input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']");
-                for (let i = 0; i < inputs.length; i++) {
-                    const rect = inputs[i].getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        return inputs[i];
+                function findInput(root) {
+                    if (!root) return null;
+                    const inputs = root.querySelectorAll("input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']");
+                    for (let i = 0; i < inputs.length; i++) {
+                        const rect = inputs[i].getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return inputs[i];
+                        }
                     }
+                    const all = root.querySelectorAll('*');
+                    for (let i = 0; i < all.length; i++) {
+                        if (all[i].shadowRoot) {
+                            const found = findInput(all[i].shadowRoot);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
                 }
-                return null;
+                return findInput(document);
             """)
             if el:
                 return el
         except Exception:
             pass
 
+        # 3. Try iframes - only if we are at the top level
+        try:
+            is_iframe = driver.execute_script("return window.self !== window.top;")
+            if not is_iframe:
+                for frame in driver.find_elements(By.TAG_NAME, "iframe"):
+                    try:
+                        driver.switch_to.frame(frame)
+                        
+                        # Selenium check
+                        els = driver.find_elements(By.CSS_SELECTOR, "input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']")
+                        for el in els:
+                            if el.is_displayed():
+                                print("  [find_share] Found input in iframe (Selenium).")
+                                return el  # Leave driver in iframe
+                        
+                        # JS with Shadow DOM piercing inside iframe
+                        el = driver.execute_script("""
+                            function findInput(root) {
+                                if (!root) return null;
+                                const inputs = root.querySelectorAll("input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']");
+                                for (let i = 0; i < inputs.length; i++) {
+                                    const rect = inputs[i].getBoundingClientRect();
+                                    if (rect.width > 0 && rect.height > 0) {
+                                        return inputs[i];
+                                    }
+                                }
+                                const all = root.querySelectorAll('*');
+                                for (let i = 0; i < all.length; i++) {
+                                    if (all[i].shadowRoot) {
+                                        const found = findInput(all[i].shadowRoot);
+                                        if (found) return found;
+                                    }
+                                }
+                                return null;
+                            }
+                            return findInput(document);
+                        """)
+                        if el:
+                            print("  [find_share] Found input in iframe (JS).")
+                            return el  # Leave driver in iframe
+                    except Exception:
+                        pass
+                    
+                    driver.switch_to.default_content()
+        except Exception:
+            pass
+
         time.sleep(0.5)
 
     print("  [find_share] Timeout waiting for share input to appear.")
+    # Diagnostic dump
+    try:
+        print(f"  [find_share] Current URL: {driver.current_url}")
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        print(f"  [find_share] Found {len(iframes)} iframes.")
+        for i, f in enumerate(iframes):
+            print(f"    iframe {i}: class='{f.get_attribute('class')}', id='{f.get_attribute('id')}', src='{f.get_attribute('src')}'")
+        
+        inputs = driver.find_elements(By.TAG_NAME, "input")
+        print(f"  [find_share] Found {len(inputs)} inputs on page.")
+        for i, inp in enumerate(inputs):
+            print(f"    input {i}: type='{inp.get_attribute('type')}', jsname='{inp.get_attribute('jsname')}', aria-label='{inp.get_attribute('aria-label')}'")
+    except Exception as e:
+        print(f"  [find_share] Diagnostic dump failed: {e}")
+    
     return None
 
 
@@ -526,7 +603,7 @@ def paste_batch_no_enter(driver, emails):
             continue
         total += 1
 
-        # Re-find the input each time
+        # Re-find the input each time (but keep frame context)
         current_input = find_share_people_input(driver, timeout=5) or input_field
         inserted, chipped = insert_email_into_share(driver, current_input, email)
         if inserted:
