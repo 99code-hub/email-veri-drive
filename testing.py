@@ -19,7 +19,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-# --- pyperclip is required for reliable clipboard paste into Google Drive share box ---
 try:
     import pyperclip
     PYPERCLIP_AVAILABLE = True
@@ -60,12 +59,11 @@ global_email_index = 0
 
 
 # ---------------------------------------------------------------------------
-# Config / file helpers
+# Config / file helpers (unchanged)
 # ---------------------------------------------------------------------------
 
 def load_config_and_emails():
     global add_user_batch_size, all_add_users
-
     add_user_batch_size = 0
     try:
         cfg_file = "config"
@@ -149,29 +147,22 @@ def write_unique_lines(path, values):
 
 
 def parse_email_lines(lines):
-    valid = []
-    errors = []
-    seen_valid = set()
-    seen_error = set()
-
+    valid, errors = [], []
+    seen_valid, seen_error = set(), set()
     for raw in lines:
         line = normalize_line(raw)
         if not line:
             continue
-
         if "No Google account found" in line:
             if line not in seen_error:
                 errors.append(line)
                 seen_error.add(line)
             continue
-
         emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", line)
         if not emails:
             continue
-
         if len(emails) == 1 and line == emails[0]:
             continue
-
         selected = None
         if len(emails) >= 2 and len(set(emails)) == 1:
             selected = emails[0]
@@ -179,16 +170,14 @@ def parse_email_lines(lines):
             selected = emails[0]
         elif len(emails) >= 2:
             selected = emails[0]
-
         if selected and selected not in seen_valid:
             valid.append(selected)
             seen_valid.add(selected)
-
     return valid, errors
 
 
 # ---------------------------------------------------------------------------
-# Share dialog discovery
+# Share dialog discovery (unchanged)
 # ---------------------------------------------------------------------------
 
 def wait_for_share_modal(driver, timeout=20):
@@ -203,14 +192,12 @@ def wait_for_share_modal(driver, timeout=20):
                     pass
         except Exception:
             pass
-
         try:
             h = driver.find_element(By.XPATH, "//*[contains(text(), 'Share \"Resume\"') or contains(@aria-label, 'Share')]")
             if h.is_displayed():
                 return h
         except Exception:
             pass
-
         time.sleep(0.3)
     return None
 
@@ -236,8 +223,7 @@ def find_share_people_input(driver, timeout=20):
         if dialog is not None:
             for by, selector in selectors:
                 try:
-                    els = dialog.find_elements(by, selector)
-                    for el in els:
+                    for el in dialog.find_elements(by, selector):
                         try:
                             if el.is_displayed() and el.is_enabled():
                                 return el
@@ -245,11 +231,9 @@ def find_share_people_input(driver, timeout=20):
                             pass
                 except Exception:
                     pass
-
         for by, selector in selectors:
             try:
-                els = driver.find_elements(by, selector)
-                for el in els:
+                for el in driver.find_elements(by, selector):
                     try:
                         if el.is_displayed() and el.is_enabled():
                             return el
@@ -257,36 +241,30 @@ def find_share_people_input(driver, timeout=20):
                         pass
             except Exception:
                 pass
-
         time.sleep(0.25)
-
     return None
 
 
 # ---------------------------------------------------------------------------
-# Reliable share-dialog text insertion
+# Share-dialog paste — REWRITTEN
 #
-# Google Drive's share input is a React-controlled <input>. Reliable insertion
-# requires the browser to fire the full event chain (beforeinput -> input).
-# CDP's Input.insertText does exactly that at the browser level and does not
-# depend on the system clipboard. send_keys / Ctrl+V are kept only as fallbacks.
+# Diagnosis: the input is a Material Design chip-input (<input> wrapped in
+# .YMNIz with a sibling span overlay). element.send_keys alone often "succeeds"
+# at the Selenium level but the keystrokes never reach the actual DOM input
+# because Selenium clicks the overlay. The pattern that works with MDC
+# comboboxes is a single ActionChains chain: move_to_element -> click ->
+# send_keys -> perform(). Everything else is a fallback.
 # ---------------------------------------------------------------------------
 
 def get_active_element_info(driver):
-    """Debug helper: describe whatever currently holds focus in the page."""
     try:
         return driver.execute_script("""
             const el = document.activeElement;
             if (!el) return null;
             return {
-                tag: el.tagName,
-                type: el.type || null,
-                role: el.getAttribute('role'),
+                tag: el.tagName, type: el.type || null,
+                role: el.getAttribute('role'), jsname: el.getAttribute('jsname'),
                 ariaLabel: el.getAttribute('aria-label'),
-                jsname: el.getAttribute('jsname'),
-                placeholder: el.getAttribute('placeholder'),
-                id: el.id || null,
-                className: (el.className || '').toString().slice(0, 120),
                 value: (el.value === undefined) ? null : el.value,
                 contentEditable: el.getAttribute('contenteditable'),
             };
@@ -295,107 +273,153 @@ def get_active_element_info(driver):
         return None
 
 
-def _current_input_value(driver, input_field):
-    """Return the current .value of the share input, or None if unavailable."""
+def describe_input(driver, input_field):
+    """Return a dict of properties about the share input — used for logging."""
     try:
-        return input_field.get_attribute("value")
-    except Exception:
-        pass
-    try:
-        return driver.execute_script("return arguments[0].value;", input_field)
+        return driver.execute_script("""
+            const el = arguments[0];
+            const rect = el.getBoundingClientRect();
+            return {
+                tag: el.tagName, type: el.type,
+                jsname: el.getAttribute('jsname'),
+                ariaLabel: el.getAttribute('aria-label'),
+                ariaExpanded: el.getAttribute('aria-expanded'),
+                disabled: el.disabled, readOnly: el.readOnly,
+                visible: rect.width > 0 && rect.height > 0,
+                value: el.value,
+                focused: document.activeElement === el,
+            };
+        """, input_field)
     except Exception:
         return None
 
 
-def ensure_focus_on_input(driver, input_field):
+def _input_value(driver, input_field):
+    try:
+        return input_field.get_attribute("value")
+    except Exception:
+        return None
+
+
+def _aria_expanded(driver, input_field):
+    try:
+        return input_field.get_attribute("aria-expanded")
+    except Exception:
+        return None
+
+
+def _clear_share_input(driver, input_field):
+    """Clear the input without disturbing React (Ctrl+A, Delete)."""
+    try:
+        ActionChains(driver).move_to_element(input_field).click().perform()
+        time.sleep(0.1)
+        ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
+        time.sleep(0.05)
+        ActionChains(driver).send_keys(Keys.DELETE).perform()
+        time.sleep(0.1)
+    except Exception:
+        pass
+
+
+def _insert_email_atomic(driver, input_field, email):
     """
-    Force focus onto the share input without disturbing React's state.
-    Prefers a real mouse click via ActionChains. Verifies via document.activeElement.
+    PRIMARY METHOD — the MDC combobox pattern.
+    A single ActionChains chain: move → click → send_keys → perform().
+    This clicks the input directly (not the overlay) and sends keys to it.
+    Returns True if the field's value contains the email afterward.
+    """
+    try:
+        ActionChains(driver).move_to_element(input_field).click().send_keys(email).perform()
+        time.sleep(0.4)
+        val = _input_value(driver, input_field) or ""
+        if email in val:
+            return True
+    except Exception as e:
+        print(f"    [atomic] failed: {e}")
+    return False
+
+
+def _insert_email_send_keys(driver, input_field, email):
+    """Fallback: element.send_keys directly (works if focus is truly on input)."""
+    try:
+        input_field.click()
+        time.sleep(0.1)
+        input_field.send_keys(email)
+        time.sleep(0.4)
+        val = _input_value(driver, input_field) or ""
+        if email in val:
+            return True
+    except Exception as e:
+        print(f"    [send_keys] failed: {e}")
+    return False
+
+
+def _insert_email_cdp(driver, input_field, email):
+    """Fallback: CDP Input.insertText (browser-level typing, fires full event chain)."""
+    try:
+        driver.execute_script("arguments[0].focus();", input_field)
+        time.sleep(0.1)
+        driver.execute_cdp_cmd("Input.insertText", {"text": email})
+        time.sleep(0.5)
+        val = _input_value(driver, input_field) or ""
+        if email in val:
+            return True
+    except Exception as e:
+        print(f"    [cdp] failed: {e}")
+    return False
+
+
+def _insert_email_char_by_char(driver, input_field, email):
+    """
+    Fallback: type one character at a time with 60 ms delays.
+    Useful when the app debounces input events or when the whole string
+    arrives faster than React's onChange handler can process.
     """
     try:
         ActionChains(driver).move_to_element(input_field).click().perform()
-        time.sleep(0.15)
-    except Exception:
-        try:
-            input_field.click()
-            time.sleep(0.15)
-        except Exception:
-            try:
-                driver.execute_script("arguments[0].focus();", input_field)
-                time.sleep(0.15)
-            except Exception:
-                return False
-
-    try:
-        focused = driver.execute_script(
-            "return document.activeElement === arguments[0];", input_field
-        )
-        return bool(focused)
-    except Exception:
-        return True
-
-
-def insert_text_cdp(driver, text):
-    """Primary insertion method — CDP Input.insertText. Browser-level typing."""
-    try:
-        driver.execute_cdp_cmd("Input.insertText", {"text": text})
-        time.sleep(0.35)
-        return True
+        time.sleep(0.1)
+        for ch in email:
+            ActionChains(driver).send_keys(ch).perform()
+            time.sleep(0.06)
+        time.sleep(0.4)
+        val = _input_value(driver, input_field) or ""
+        if email in val:
+            return True
     except Exception as e:
-        print(f"    [insertText] CDP failed: {e}")
-        return False
+        print(f"    [char-by-char] failed: {e}")
+    return False
 
 
-def insert_text_active_element(driver, text):
-    """Fallback: send_keys to whatever document.activeElement is."""
-    try:
-        active = driver.switch_to.active_element
-        active.send_keys(text)
-        time.sleep(0.3)
-        return True
-    except Exception as e:
-        print(f"    [active.send_keys] failed: {e}")
-        return False
-
-
-def insert_text_actionchains(driver, text):
-    """Fallback: ActionChains send_keys to whatever has browser focus."""
-    try:
-        ActionChains(driver).send_keys(text).perform()
-        time.sleep(0.3)
-        return True
-    except Exception as e:
-        print(f"    [actionchains.send_keys] failed: {e}")
-        return False
-
-
-def insert_text_clipboard(driver, text):
-    """Fallback: pyperclip + Ctrl+V. Skipped if pyperclip isn't available."""
+def _insert_email_clipboard(driver, input_field, email):
+    """Fallback: pyperclip + Ctrl+V."""
     if not PYPERCLIP_AVAILABLE:
         return False
     try:
-        pyperclip.copy(text)
+        pyperclip.copy(email)
+        ActionChains(driver).move_to_element(input_field).click().perform()
+        time.sleep(0.1)
         ActionChains(driver).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-        time.sleep(0.35)
-        return True
+        time.sleep(0.5)
+        val = _input_value(driver, input_field) or ""
+        if email in val:
+            return True
     except Exception as e:
         print(f"    [clipboard] failed: {e}")
-        return False
+    return False
 
 
-def insert_text_js_react(driver, input_field, text):
+def _insert_email_js_react(driver, input_field, email):
     """
-    Last-resort fallback: set the value via the native setter (bypasses React's
-    value tracker) and dispatch the events React listens for.
+    Last resort: native-setter + full InputEvent chain (beforeinput → input → change).
+    Bypasses React's value tracker and fires every event Google's handlers listen for.
     """
     try:
         driver.execute_script("""
-            const el = arguments[0];
-            const text = arguments[1];
-            const nativeSetter = Object.getOwnPropertyDescriptor(
+            const el = arguments[0], text = arguments[1];
+            const setter = Object.getOwnPropertyDescriptor(
                 window.HTMLInputElement.prototype, 'value'
             ).set;
-            nativeSetter.call(el, text);
+            setter.call(el, text);
             el.dispatchEvent(new InputEvent('beforeinput', {
                 bubbles: true, cancelable: true, inputType: 'insertText', data: text
             }));
@@ -403,129 +427,158 @@ def insert_text_js_react(driver, input_field, text):
                 bubbles: true, inputType: 'insertText', data: text
             }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
-        """, input_field, text)
-        time.sleep(0.35)
-        return True
+        """, input_field, email)
+        time.sleep(0.5)
+        val = _input_value(driver, input_field) or ""
+        if email in val:
+            return True
     except Exception as e:
         print(f"    [js-react] failed: {e}")
+    return False
+
+
+def _wait_for_dropdown(driver, input_field, timeout=3.0):
+    """
+    Wait for the autocomplete dropdown to open (aria-expanded='true').
+    Enter will only create a chip if the dropdown is open — this is the
+    single most important precondition that was missing before.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        if _aria_expanded(driver, input_field) == "true":
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _confirm_chip(driver, input_field, email):
+    """
+    Convert the typed email into a recipient chip.
+    Tries Enter → Tab → comma → click dropdown option, in that order.
+    Success = the input's .value becomes empty (Google clears it on chip creation).
+    """
+    value_before = _input_value(driver, input_field) or ""
+    if not value_before.strip():
         return False
 
-
-def confirm_chip(driver, input_field, timeout=1.5):
-    """
-    Press Enter (then Tab, then comma) to convert the typed email into a
-    recipient chip. Verifies success by checking whether the input was cleared.
-    Google clears the input on successful chip creation.
-    """
-    value_before = _current_input_value(driver, input_field)
-    if not (value_before or "").strip():
-        return False
-
-    for key_combo in ([Keys.ENTER], [Keys.TAB], [","]):
+    for key in [Keys.ENTER, Keys.TAB, ",", ";"]:
         try:
-            ActionChains(driver).send_keys(*key_combo).perform()
+            ActionChains(driver).send_keys(key).perform()
         except Exception:
-            continue
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            value_now = _current_input_value(driver, input_field)
-            if value_now is not None and not value_now.strip():
-                return True
-            time.sleep(0.1)
+            try:
+                input_field.send_keys(key)
+            except Exception:
+                continue
+        time.sleep(0.5)
+        val_now = _input_value(driver, input_field)
+        if val_now is not None and not val_now.strip():
+            return True
+
+    # Last resort: click the autocomplete suggestion (usually "Invite <email>")
+    try:
+        options = driver.find_elements(By.CSS_SELECTOR, "[role='listbox'] [role='option'], [role='listbox'] li")
+        for opt in options:
+            try:
+                if not opt.is_displayed():
+                    continue
+                txt = (opt.text or "").strip()
+                if email in txt or "Invite" in txt:
+                    opt.click()
+                    time.sleep(0.5)
+                    val_now = _input_value(driver, input_field)
+                    if val_now is not None and not val_now.strip():
+                        return True
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     return False
 
 
 def insert_email_into_share(driver, input_field, email):
-    """
-    Insert one email into the share input using whichever method actually works,
-    then confirm with Enter. Returns (inserted, chipped).
-    """
+    """Insert one email using layered fallbacks. Returns (inserted, chipped)."""
     email = str(email).strip()
     if not email:
         return False, False
 
-    if not ensure_focus_on_input(driver, input_field):
-        print("    Could not focus the share input.")
+    print(f"    [email] {email}")
 
-    # Clear any residual text first
+    # Make sure the input has focus (JS focus is the most reliable here)
     try:
-        ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-        time.sleep(0.08)
-        ActionChains(driver).send_keys(Keys.DELETE).perform()
-        time.sleep(0.1)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", input_field)
+        driver.execute_script("arguments[0].focus();", input_field)
+        time.sleep(0.15)
     except Exception:
         pass
 
+    _clear_share_input(driver, input_field)
+
     methods = [
-        ("CDP insertText",         lambda: insert_text_cdp(driver, email)),
-        ("active.send_keys",       lambda: insert_text_active_element(driver, email)),
-        ("ActionChains.send_keys", lambda: insert_text_actionchains(driver, email)),
-        ("pyperclip + Ctrl+V",     lambda: insert_text_clipboard(driver, email)),
-        ("JS + React events",      lambda: insert_text_js_react(driver, input_field, email)),
+        ("atomic ActionChains", lambda: _insert_email_atomic(driver, input_field, email)),
+        ("element.send_keys",   lambda: _insert_email_send_keys(driver, input_field, email)),
+        ("CDP insertText",      lambda: _insert_email_cdp(driver, input_field, email)),
+        ("char-by-char",        lambda: _insert_email_char_by_char(driver, input_field, email)),
+        ("pyperclip + Ctrl+V",  lambda: _insert_email_clipboard(driver, input_field, email)),
+        ("JS native-setter",    lambda: _insert_email_js_react(driver, input_field, email)),
     ]
 
     inserted = False
-    for name, method in methods:
-        before = _current_input_value(driver, input_field) or ""
-        ok = method()
-        after = _current_input_value(driver, input_field)
-        if after is not None and email in after and after != before:
-            print(f"    Inserted via {name}. Field now: {after!r}")
-            inserted = True
-            break
-        elif ok and after is None:
-            print(f"    Inserted via {name} (could not verify value).")
-            inserted = True
-            break
-        else:
-            print(f"    {name} ran but field value unchanged ({after!r}).")
-            try:
-                ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-                ActionChains(driver).send_keys(Keys.DELETE).perform()
-                time.sleep(0.1)
-            except Exception:
-                pass
+    used_method = None
+    for name, fn in methods:
+        try:
+            if fn():
+                inserted = True
+                used_method = name
+                print(f"    [insert] OK via {name}, value={(_input_value(driver, input_field) or '')!r}")
+                break
+            else:
+                print(f"    [insert] {name} produced no change")
+        except Exception as e:
+            print(f"    [insert] {name} raised: {e}")
 
     if not inserted:
-        print(f"    All insertion methods failed for '{email}'.")
-        info = get_active_element_info(driver)
-        print(f"    Focused element: {info}")
+        print(f"    [insert] ALL METHODS FAILED")
+        print(f"    [insert] Active element: {get_active_element_info(driver)}")
+        print(f"    [insert] Input info:     {describe_input(driver, input_field)}")
         return False, False
 
-    chipped = confirm_chip(driver, input_field)
-    if chipped:
-        print(f"    Confirmed chip for '{email}'.")
-    else:
-        print(f"    Text inserted but chip not confirmed for '{email}'.")
-    return True, chipped
+    # Wait for the dropdown to register the typed text
+    dropdown = _wait_for_dropdown(driver, input_field, timeout=3.0)
+    print(f"    [dropdown] {'opened' if dropdown else 'DID NOT open'}")
+    if not dropdown:
+        # Extra delay — some slow tenants take >3s
+        time.sleep(1.5)
+        dropdown = _aria_expanded(driver, input_field) == "true"
+
+    # Confirm the chip
+    chipped = _confirm_chip(driver, input_field, email)
+    print(f"    [chip] {'created' if chipped else 'NOT created (method was ' + str(used_method) + ')'}")
+
+    return inserted, chipped
 
 
 def paste_batch_no_enter(driver, emails):
     """
     Add each email as a recipient in the share dialog.
-    (Name kept for compatibility — we DO press Enter to create chips.)
+    (Name kept for backward compatibility — we DO press Enter to create chips.)
     """
+    # React needs a moment to fully mount the dialog after it becomes visible
+    time.sleep(2)
+
     input_field = find_share_people_input(driver, timeout=20)
     if input_field is None:
-        print("  Share dialog email input not found.")
+        print("  Share dialog input not found.")
         print(f"  Active element: {get_active_element_info(driver)}")
         return False
 
-    try:
-        already_focused = driver.execute_script(
-            "return document.activeElement === arguments[0];", input_field
-        )
-    except Exception:
-        already_focused = False
-
-    if not already_focused:
-        if not ensure_focus_on_input(driver, input_field):
-            print("  Could not focus the share input; continuing anyway.")
+    print(f"  Input found: {describe_input(driver, input_field)}")
 
     inserted_count = 0
     chipped_count = 0
     total = 0
+    failed_emails = []
 
     for email in emails:
         email = str(email).strip()
@@ -533,32 +586,34 @@ def paste_batch_no_enter(driver, emails):
             continue
         total += 1
 
-        # Re-find the input each iteration — React replaces the element after
-        # each chip is added, so the old reference becomes stale.
-        current_input = find_share_people_input(driver, timeout=5)
-        if current_input is None:
-            current_input = input_field
+        # Re-find the input for each email — React replaces the node after
+        # each chip, so the previous element reference is stale.
+        current_input = find_share_people_input(driver, timeout=5) or input_field
 
         inserted, chipped = insert_email_into_share(driver, current_input, email)
         if inserted:
             inserted_count += 1
         if chipped:
             chipped_count += 1
+        else:
+            failed_emails.append(email)
 
-        time.sleep(0.25)
+        time.sleep(0.3)
 
     print(f"  Inserted {inserted_count}/{total}, confirmed chips {chipped_count}/{total}.")
+    if failed_emails:
+        print(f"  Emails that failed chip creation: {failed_emails[:10]}{'...' if len(failed_emails) > 10 else ''}")
+
     return chipped_count > 0 or inserted_count > 0
 
 
 # ---------------------------------------------------------------------------
-# Windows Save dialog helper
+# Windows Save dialog helper (unchanged)
 # ---------------------------------------------------------------------------
 
 def click_save_in_windows_dialog(filename_hint=None, timeout=12):
     if "Desktop" not in globals() or Desktop is None:
         return False
-
     end_time = time.time() + timeout
     desktop = Desktop(backend="uia")
     while time.time() < end_time:
@@ -566,12 +621,7 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
             candidates = []
             if filename_hint:
                 candidates.append({"title_re": f".*{re.escape(filename_hint)}.*"})
-            candidates += [
-                {"title_re": ".*Save As.*"},
-                {"title_re": ".*File Download.*"},
-                {"title_re": ".*Open.*"},
-            ]
-
+            candidates += [{"title_re": ".*Save As.*"}, {"title_re": ".*File Download.*"}, {"title_re": ".*Open.*"}]
             dlg = None
             for c in candidates:
                 try:
@@ -581,7 +631,6 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
                         break
                 except Exception:
                     dlg = None
-
             if dlg is None:
                 for w in desktop.windows():
                     try:
@@ -590,7 +639,6 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
                             break
                     except Exception:
                         continue
-
             if dlg is not None and dlg.exists():
                 try:
                     btn = dlg.child_window(title="Save", control_type="Button")
@@ -616,7 +664,7 @@ def click_save_in_windows_dialog(filename_hint=None, timeout=12):
 
 
 # ---------------------------------------------------------------------------
-# Login helpers
+# Login helpers (unchanged)
 # ---------------------------------------------------------------------------
 
 def load_credentials(path):
@@ -638,8 +686,7 @@ def click_next_button(driver):
             f"//input[@type='submit' and contains(@value, '{text}')] | "
             f"//*[@role='button' and contains(normalize-space(.), '{text}')]"
         )
-        elements = driver.find_elements(By.XPATH, xpath)
-        for el in elements:
+        for el in driver.find_elements(By.XPATH, xpath):
             try:
                 if el.is_displayed() and el.is_enabled():
                     el.click()
@@ -704,36 +751,24 @@ def click_google_docs_share_button(driver):
             result = driver.execute_script("""
             const wrapper = document.querySelector('#docs-titlebar-share-client-button');
             if (!wrapper) return {ok: false, reason: 'wrapper_not_found'};
-
             const btn = wrapper.querySelector('div[role="button"][aria-label="Share. Private to only me. "]');
             if (!btn) return {ok: false, reason: 'button_not_found'};
-
             const rect = btn.getBoundingClientRect();
             if (!rect.width || !rect.height) return {ok: false, reason: 'not_visible'};
-
             const style = window.getComputedStyle(btn);
             if (style.pointerEvents === 'none' || style.display === 'none' || style.visibility === 'hidden') {
                 return {ok: false, reason: 'blocked_by_css'};
             }
-
             btn.scrollIntoView({block: 'center', inline: 'center'});
             btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
             btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
             btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-
             return {ok: true, reason: 'clicked'};
             """)
             print(f"  Share button live DOM click attempt {attempt + 1}: {result}")
-
             time.sleep(1)
-
             share_modal = driver.execute_script("""
-            const candidates = [
-                '[role="dialog"]',
-                '[aria-label*="Share"]',
-                '[aria-label*="People"]',
-                '[aria-label*="Invite"]'
-            ];
+            const candidates = ['[role="dialog"]', '[aria-label*="Share"]', '[aria-label*="People"]', '[aria-label*="Invite"]'];
             for (const sel of candidates) {
                 if (document.querySelector(sel)) return true;
             }
@@ -742,12 +777,9 @@ def click_google_docs_share_button(driver):
             if share_modal:
                 print("  Share modal/dialog opened.")
                 return True
-
         except Exception as e:
             print(f"  Share button JS click attempt {attempt + 1} failed: {e}")
-
         time.sleep(1)
-
     print("  Share button still not clickable from the live DOM.")
     return False
 
@@ -763,7 +795,6 @@ def process_email_file_in_batches(driver, input_path, limit):
     except FileNotFoundError:
         print(f"  Input file not found: {input_path}")
         return
-
     if not lines:
         print("  No lines found in input file.")
         return
@@ -793,7 +824,6 @@ def process_email_file_in_batches(driver, input_path, limit):
         valid_list, error_list = parse_email_lines(batch)
         write_unique_lines(VALID_OUTPUT_PATH, valid_list)
         write_unique_lines(ERROR_OUTPUT_PATH, error_list)
-
         print(f"  Valid emails saved: {len(valid_list)}")
         print(f"  Error lines saved: {len(error_list)}")
 
@@ -801,12 +831,11 @@ def process_email_file_in_batches(driver, input_path, limit):
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
-
         time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
-# Main login flow
+# Main login flow (unchanged)
 # ---------------------------------------------------------------------------
 
 def attempt_login(driver, email, password):
@@ -886,13 +915,8 @@ def attempt_login(driver, email, password):
     privacy_default = "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement"
     terms_default = "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service"
     domain_default = "github.com"
-
     website_config_file = "website_config"
-    home_page_url = home_page_default
-    privacy_url = privacy_default
-    terms_url = terms_default
-    domain_value = domain_default
-
+    home_page_url, privacy_url, terms_url, domain_value = home_page_default, privacy_default, terms_default, domain_default
     try:
         with open(website_config_file, "r", encoding="utf-8") as wf:
             for ln in wf:
@@ -901,18 +925,13 @@ def attempt_login(driver, email, password):
                     continue
                 if "=" in ln:
                     k, v = ln.split("=", 1)
-                    k = k.strip().lower()
-                    v = v.strip()
+                    k, v = k.strip().lower(), v.strip()
                     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                         v = v[1:-1]
-                    if k == "home":
-                        home_page_url = v or home_page_default
-                    elif k == "privacy":
-                        privacy_url = v or privacy_default
-                    elif k == "terms":
-                        terms_url = v or terms_default
-                    elif k == "domain":
-                        domain_value = v or domain_default
+                    if k == "home": home_page_url = v or home_page_default
+                    elif k == "privacy": privacy_url = v or privacy_default
+                    elif k == "terms": terms_url = v or terms_default
+                    elif k == "domain": domain_value = v or domain_default
         print(f"  website_config loaded: home={home_page_url}, privacy={privacy_url}, terms={terms_url}, domain={domain_value}")
     except FileNotFoundError:
         print("  website_config not found, using defaults for home/privacy/terms/domain.")
@@ -996,16 +1015,11 @@ def attempt_login(driver, email, password):
 
     if CONSENT_CHECKBOX_SELECTOR:
         try:
-            checkbox = WebDriverWait(driver, 3).until(
-                EC.presence_of_element_located(CONSENT_CHECKBOX_SELECTOR)
-            )
+            checkbox = WebDriverWait(driver, 3).until(EC.presence_of_element_located(CONSENT_CHECKBOX_SELECTOR))
             driver.execute_script("arguments[0].click();", checkbox)
             print("  Clicked consent checkbox.")
             time.sleep(1)
-
-            agree_btn = WebDriverWait(driver, 3).until(
-                EC.presence_of_element_located((By.XPATH, AGREE_BUTTON_XPATH))
-            )
+            agree_btn = WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, AGREE_BUTTON_XPATH)))
             driver.execute_script("arguments[0].click();", agree_btn)
             print("  Clicked Agree and continue.")
             time.sleep(3)
@@ -1021,7 +1035,6 @@ def attempt_login(driver, email, password):
     try:
         print("  Starting email batch share flow after successful login.")
         time.sleep(10)
-
         try:
             template_img = WebDriverWait(driver, 20).until(
                 EC.element_to_be_clickable(
@@ -1058,14 +1071,13 @@ def main():
     load_config_and_emails()
 
     if not PYPERCLIP_AVAILABLE:
-        print("WARNING: pyperclip is not installed. Clipboard paste will be skipped.")
-        print("         Install with: pip install pyperclip\n")
+        print("NOTE: pyperclip not installed; clipboard method will be skipped.")
+        print("      Install with: pip install pyperclip\n")
 
     creds = load_credentials(CREDENTIALS_FILE)
     print(f"Loaded {len(creds)} credential pairs from {CREDENTIALS_FILE}")
 
     print("Launching Chrome ...")
-
     download_dir = DOWNLOAD_DIR if 'DOWNLOAD_DIR' in globals() else os.getcwd()
     os.makedirs(download_dir, exist_ok=True)
 
@@ -1091,7 +1103,6 @@ def main():
         driver = None
         for i, (email, password) in enumerate(creds, 1):
             print(f"[{i}/{len(creds)}] Testing {email} ...")
-
             try:
                 driver = webdriver.Chrome(options=chrome_options)
                 try:
@@ -1101,7 +1112,6 @@ def main():
                     )
                 except Exception:
                     pass
-
                 try:
                     driver.execute_cdp_cmd("Page.setDownloadBehavior", {
                         "behavior": "allow",
@@ -1109,18 +1119,15 @@ def main():
                     })
                 except Exception as e:
                     print(f"  Warning: Page.setDownloadBehavior failed: {e}")
-
                 try:
                     outcome = attempt_login(driver, email, password)
                 except Exception as e:
                     print(f"  attempt_login raised an exception for {email}: {e}")
                     traceback.print_exc()
                     outcome = "ERROR"
-
             except Exception as e:
                 print(f"  Could not start Chrome for {email}: {e}")
                 outcome = "ERROR"
-
             finally:
                 try:
                     if driver is not None:
@@ -1128,10 +1135,8 @@ def main():
                 except Exception:
                     pass
                 driver = None
-
             print(f"  -> {outcome}")
             results.append((email, outcome))
-
             time.sleep(DELAY_BETWEEN_ATTEMPTS)
     finally:
         try:
@@ -1144,7 +1149,6 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["email", "result"])
         writer.writerows(results)
-
     print(f"\nDone. Results saved to {RESULTS_FILE}")
 
 
