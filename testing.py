@@ -177,94 +177,51 @@ def parse_email_lines(lines):
 
 
 # ---------------------------------------------------------------------------
-# Share dialog discovery
+# Share dialog discovery — FIXED
 # ---------------------------------------------------------------------------
 
-def wait_for_share_modal(driver, timeout=20):
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        try:
-            for d in driver.find_elements(By.XPATH, "//div[@role='dialog']"):
-                try:
-                    if d.is_displayed():
-                        return d
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            h = driver.find_element(By.XPATH, "//*[contains(text(), 'Share \"Resume\"') or contains(@aria-label, 'Share')]")
-            if h.is_displayed():
-                return h
-        except Exception:
-            pass
-        time.sleep(0.3)
-    return None
-
-
 def find_share_people_input(driver, timeout=20):
+    """
+    Finds the share dialog input. Uses a JS fallback because Selenium's
+    is_displayed() frequently fails on Material Design animated dialogs.
+    """
     end_time = time.time() + timeout
-    dialog = wait_for_share_modal(driver, timeout=5)
-
-    selectors = [
-        (By.CSS_SELECTOR, "div[jsname='w1sQPc'] input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
-        (By.CSS_SELECTOR, "div[jsname='w1sQPc'] input[role='combobox'][jsname='YPqjbf']"),
-        (By.CSS_SELECTOR, "div[jsname='w1sQPc'] input[aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.CSS_SELECTOR, "input.zeumMd.d2j1H[role='combobox'][jsname='YPqjbf']"),
-        (By.CSS_SELECTOR, "input[role='combobox'][jsname='YPqjbf']"),
-        (By.CSS_SELECTOR, "input[aria-label='Add people, groups, spaces, and calendar events']"),
-        (By.XPATH, "//div[jsname='w1sQPc']//input[@jsname='YPqjbf']"),
-        (By.XPATH, "//div[@role='dialog']//input[@jsname='YPqjbf']"),
-        (By.XPATH, "//input[@role='combobox' and @jsname='YPqjbf']"),
-        (By.XPATH, "//input[@aria-label='Add people, groups, spaces, and calendar events']"),
-    ]
-
     while time.time() < end_time:
-        if dialog is not None:
-            for by, selector in selectors:
-                try:
-                    for el in dialog.find_elements(by, selector):
-                        try:
-                            if el.is_displayed() and el.is_enabled():
-                                return el
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        for by, selector in selectors:
-            try:
-                for el in driver.find_elements(by, selector):
-                    try:
-                        if el.is_displayed() and el.is_enabled():
-                            return el
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        time.sleep(0.25)
+        # 1. Try Selenium's native wait (works best if fully rendered)
+        try:
+            el = WebDriverWait(driver, 1).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "input[jsname='YPqjbf']"))
+            )
+            return el
+        except Exception:
+            pass
+
+        # 2. JS fallback (guaranteed to find it based on bounding box, bypassing is_displayed)
+        try:
+            el = driver.execute_script("""
+                const inputs = document.querySelectorAll("input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']");
+                for (let i = 0; i < inputs.length; i++) {
+                    const rect = inputs[i].getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return inputs[i];
+                    }
+                }
+                return null;
+            """)
+            if el:
+                return el
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    print("  [find_share] Timeout waiting for share input to appear.")
     return None
 
 
 # ---------------------------------------------------------------------------
 # Share-dialog paste — EXTREME FALLBACKS
 # ---------------------------------------------------------------------------
-
-def get_active_element_info(driver):
-    try:
-        return driver.execute_script("""
-            const el = document.activeElement;
-            if (!el) return null;
-            return {
-                tag: el.tagName, type: el.type || null,
-                role: el.getAttribute('role'), jsname: el.getAttribute('jsname'),
-                ariaLabel: el.getAttribute('aria-label'),
-                value: (el.value === undefined) ? null : el.value,
-                contentEditable: el.getAttribute('contenteditable'),
-            };
-        """)
-    except Exception:
-        return None
-
 
 def describe_input(driver, input_field):
     try:
@@ -301,7 +258,6 @@ def _aria_expanded(driver, input_field):
 
 
 def _clear_share_input(driver, input_field):
-    # Forcefully clear via JS (bypasses focus issues with Ctrl+A / Delete)
     try:
         driver.execute_script("""
             const el = arguments[0];
@@ -470,7 +426,6 @@ def _confirm_chip(driver, input_field, email):
         if val_now is not None and not val_now.strip():
             return True
 
-    # Click the autocomplete suggestion if Enter didn't work
     try:
         options = driver.find_elements(By.CSS_SELECTOR, "[role='listbox'] [role='option'], [role='listbox'] li")
         for opt in options:
@@ -536,8 +491,6 @@ def insert_email_into_share(driver, input_field, email):
 
     if not inserted:
         print(f"    [insert] ALL METHODS FAILED")
-        print(f"    [insert] Active element: {get_active_element_info(driver)}")
-        print(f"    [insert] Input info:     {describe_input(driver, input_field)}")
         return False, False
 
     dropdown = _wait_for_dropdown(driver, input_field, timeout=3.0)
@@ -558,7 +511,6 @@ def paste_batch_no_enter(driver, emails):
     input_field = find_share_people_input(driver, timeout=20)
     if input_field is None:
         print("  Share dialog input not found.")
-        print(f"  Active element: {get_active_element_info(driver)}")
         return False
 
     print(f"  Input found: {describe_input(driver, input_field)}")
@@ -574,6 +526,7 @@ def paste_batch_no_enter(driver, emails):
             continue
         total += 1
 
+        # Re-find the input each time
         current_input = find_share_people_input(driver, timeout=5) or input_field
         inserted, chipped = insert_email_into_share(driver, current_input, email)
         if inserted:
