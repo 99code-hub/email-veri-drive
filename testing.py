@@ -17,7 +17,7 @@ from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 
 try:
     import pyperclip
@@ -147,45 +147,39 @@ def write_unique_lines(path, values):
 
 
 def parse_email_lines(lines):
+    """Fixed: Now accepts plain emails, not just 'Name <email>' formats."""
     valid, errors = [], []
     seen_valid, seen_error = set(), set()
+    
     for raw in lines:
         line = normalize_line(raw)
         if not line:
             continue
+            
         if "No Google account found" in line:
             if line not in seen_error:
                 errors.append(line)
                 seen_error.add(line)
             continue
+            
         emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", line)
         if not emails:
             continue
-        if len(emails) == 1 and line == emails[0]:
-            continue
-        selected = None
-        if len(emails) >= 2 and len(set(emails)) == 1:
-            selected = emails[0]
-        elif len(emails) == 1 and len(line) > len(emails[0]) + 1:
-            selected = emails[0]
-        elif len(emails) >= 2:
-            selected = emails[0]
+            
+        # Take the first valid email found in the line
+        selected = emails[0]
         if selected and selected not in seen_valid:
             valid.append(selected)
             seen_valid.add(selected)
+            
     return valid, errors
 
 
 # ---------------------------------------------------------------------------
-# Share dialog discovery — BULLETPROOF (Shadow DOM & Iframes)
+# Share dialog discovery
 # ---------------------------------------------------------------------------
 
 def find_share_people_input(driver, timeout=20):
-    """
-    Finds the share dialog input. Uses a recursive JavaScript search to pierce
-    Shadow DOMs, and automatically switches into iframes if the input is not
-    found in the main document context.
-    """
     end_time = time.time() + timeout
     while time.time() < end_time:
         # 1. Try current frame - Selenium
@@ -278,26 +272,11 @@ def find_share_people_input(driver, timeout=20):
         time.sleep(0.5)
 
     print("  [find_share] Timeout waiting for share input to appear.")
-    # Diagnostic dump
-    try:
-        print(f"  [find_share] Current URL: {driver.current_url}")
-        iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        print(f"  [find_share] Found {len(iframes)} iframes.")
-        for i, f in enumerate(iframes):
-            print(f"    iframe {i}: class='{f.get_attribute('class')}', id='{f.get_attribute('id')}', src='{f.get_attribute('src')}'")
-        
-        inputs = driver.find_elements(By.TAG_NAME, "input")
-        print(f"  [find_share] Found {len(inputs)} inputs on page.")
-        for i, inp in enumerate(inputs):
-            print(f"    input {i}: type='{inp.get_attribute('type')}', jsname='{inp.get_attribute('jsname')}', aria-label='{inp.get_attribute('aria-label')}'")
-    except Exception as e:
-        print(f"  [find_share] Diagnostic dump failed: {e}")
-    
     return None
 
 
 # ---------------------------------------------------------------------------
-# Share-dialog paste — EXTREME FALLBACKS
+# Share-dialog paste
 # ---------------------------------------------------------------------------
 
 def describe_input(driver, input_field):
@@ -346,6 +325,8 @@ def _clear_share_input(driver, input_field):
         pass
 
 
+# -- Insertion Methods --
+
 def _insert_email_atomic(driver, input_field, email):
     try:
         actions = ActionChains(driver)
@@ -376,7 +357,6 @@ def _insert_email_send_keys(driver, input_field, email):
 
 
 def _insert_email_cdp_keys(driver, input_field, email):
-    """CDP Input.dispatchKeyEvent - generates trusted native key events."""
     try:
         driver.execute_script("arguments[0].focus();", input_field)
         time.sleep(0.2)
@@ -395,7 +375,6 @@ def _insert_email_cdp_keys(driver, input_field, email):
 
 
 def _insert_email_exec_command(driver, input_field, email):
-    """Uses document.execCommand('insertText') - native browser text insertion."""
     try:
         driver.execute_script("""
             const el = arguments[0];
@@ -412,7 +391,6 @@ def _insert_email_exec_command(driver, input_field, email):
 
 
 def _insert_email_paste_event(driver, input_field, email):
-    """Simulates a native paste event with DataTransfer."""
     try:
         driver.execute_script("""
             const el = arguments[0];
@@ -452,7 +430,6 @@ def _insert_email_clipboard(driver, input_field, email):
 
 
 def _insert_email_js_react(driver, input_field, email):
-    """Native setter + InputEvent (forces React state update)."""
     try:
         driver.execute_script("""
             const el = arguments[0], text = arguments[1];
@@ -590,8 +567,61 @@ def paste_batch_no_enter(driver, emails):
         print("  Share dialog input not found.")
         return False
 
-    print(f"  Input found: {describe_input(driver, input_field)}")
+    # --- SPEED ATTEMPT 1: BULK PASTE ---
+    try:
+        print(f"  [fast] Attempting bulk paste for {len(emails)} emails...")
+        driver.execute_script("arguments[0].focus();", input_field)
+        bulk_str = ", ".join([str(e).strip() for e in emails if str(e).strip()])
+        
+        # Using CDP for instant pasting (fires proper React events)
+        driver.execute_cdp_cmd("Input.insertText", {"text": bulk_str})
+        time.sleep(0.5)
+        
+        # Press Enter to confirm all chips
+        ActionChains(driver).send_keys(Keys.ENTER).perform()
+        time.sleep(3) # Wait for Google to process the bulk list
 
+        val = _input_value(driver, input_field)
+        if not val or not val.strip():
+            print("  [fast] Bulk paste successful. All emails chipped.")
+            return True
+        else:
+            print(f"  [fast] Bulk paste left text in field. Falling back...")
+    except Exception as e:
+        print(f"  [fast] Bulk paste failed: {e}")
+
+    # Clean up if bulk failed
+    _clear_share_input(driver, input_field)
+    time.sleep(0.5)
+
+    # --- SPEED ATTEMPT 2: FAST INDIVIDUAL LOOP ---
+    try:
+        print("  [fast] Switching to fast individual loop...")
+        success_count = 0
+        for email in emails:
+            email = str(email).strip()
+            if not email: continue
+            try:
+                driver.execute_script("arguments[0].focus();", input_field)
+                # Type and Enter immediately
+                ActionChains(driver).send_keys(email).send_keys(Keys.ENTER).perform()
+                time.sleep(0.15) # Bare minimum wait for chip creation
+                success_count += 1
+            except Exception:
+                break
+
+        val = _input_value(driver, input_field)
+        if not val or not val.strip():
+            print(f"  [fast] Fast individual loop finished ({success_count} processed).")
+            return True
+    except Exception as e:
+        print(f"  [fast] Fast loop failed: {e}")
+
+    _clear_share_input(driver, input_field)
+    time.sleep(0.5)
+
+    # --- FALLBACK 3: ROBUST SLOW LOOP ---
+    print("  [fallback] Fast methods failed. Falling back to ultra-robust method...")
     inserted_count = 0
     chipped_count = 0
     total = 0
@@ -603,15 +633,23 @@ def paste_batch_no_enter(driver, emails):
             continue
         total += 1
 
-        # Re-find the input each time (but keep frame context)
-        current_input = find_share_people_input(driver, timeout=5) or input_field
-        inserted, chipped = insert_email_into_share(driver, current_input, email)
-        if inserted:
-            inserted_count += 1
-        if chipped:
-            chipped_count += 1
-        else:
-            failed_emails.append(email)
+        try:
+            current_input = find_share_people_input(driver, timeout=5) or input_field
+            inserted, chipped = insert_email_into_share(driver, current_input, email)
+            if inserted:
+                inserted_count += 1
+            if chipped:
+                chipped_count += 1
+            else:
+                failed_emails.append(email)
+        except StaleElementReferenceException:
+            print("    [fallback] Element went stale, re-finding...")
+            current_input = find_share_people_input(driver, timeout=10)
+            if current_input:
+                inserted, chipped = insert_email_into_share(driver, current_input, email)
+                if chipped: chipped_count += 1
+            else:
+                failed_emails.append(email)
 
         time.sleep(0.3)
 
@@ -836,6 +874,7 @@ def process_email_file_in_batches(driver, input_path, limit):
 
         time.sleep(15)
 
+        # FIXED: Now uses the fixed parsing logic
         valid_list, error_list = parse_email_lines(batch)
         write_unique_lines(VALID_OUTPUT_PATH, valid_list)
         write_unique_lines(ERROR_OUTPUT_PATH, error_list)
