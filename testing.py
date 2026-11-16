@@ -147,7 +147,7 @@ def write_unique_lines(path, values):
 
 
 def parse_email_lines(lines):
-    """Fixed: Now accepts plain emails, not just 'Name <email>' formats."""
+    """Fallback parser if UI parsing fails."""
     valid, errors = [], []
     seen_valid, seen_error = set(), set()
     
@@ -166,7 +166,6 @@ def parse_email_lines(lines):
         if not emails:
             continue
             
-        # Take the first valid email found in the line
         selected = emails[0]
         if selected and selected not in seen_valid:
             valid.append(selected)
@@ -176,13 +175,85 @@ def parse_email_lines(lines):
 
 
 # ---------------------------------------------------------------------------
+# UI Validation Parsing
+# ---------------------------------------------------------------------------
+
+def get_chips_from_ui(driver):
+    """
+    Reads the Google Drive Share dialog to see which emails succeeded and failed.
+    Valid emails have standard chips.
+    Invalid emails have chips where aria-label contains "No Google account found".
+    """
+    valid_list = []
+    error_list = []
+    
+    try:
+        # Find the dialog to scope our search
+        dialog = wait_for_share_modal(driver, timeout=3)
+        root = dialog if dialog else driver
+        
+        # Google Drive uses jsname="Njthtb" for the removal button on the chips
+        chips = root.find_elements(By.XPATH, ".//span[@jsname='Njthtb'] | .//div[@jsname='Njthtb']")
+        
+        for chip in chips:
+            try:
+                aria_label = chip.get_attribute("aria-label") or ""
+                
+                # Extract the email text from the inner span
+                email_spans = chip.find_elements(By.XPATH, ".//span[@jsname='V67aGc']")
+                email = email_spans[0].text.strip() if email_spans else ""
+                
+                # Fallback to regex on aria-label if span not found
+                if not email:
+                    match = re.search(r"Remove (.*?)(No Google account found|$)", aria_label)
+                    if match:
+                        email = match.group(1).strip()
+                
+                if not email:
+                    continue
+
+                if "No Google account found" in aria_label:
+                    error_list.append(email)
+                else:
+                    valid_list.append(email)
+            except Exception:
+                pass
+                
+    except Exception as e:
+        print(f"  [ui-parse] Failed to read chips: {e}")
+        
+    return valid_list, error_list
+
+
+# ---------------------------------------------------------------------------
 # Share dialog discovery
 # ---------------------------------------------------------------------------
+
+def wait_for_share_modal(driver, timeout=20):
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        try:
+            for d in driver.find_elements(By.XPATH, "//div[@role='dialog']"):
+                try:
+                    if d.is_displayed():
+                        return d
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            h = driver.find_element(By.XPATH, "//*[contains(text(), 'Share \"Resume\"') or contains(@aria-label, 'Share')]")
+            if h.is_displayed():
+                return h
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return None
+
 
 def find_share_people_input(driver, timeout=20):
     end_time = time.time() + timeout
     while time.time() < end_time:
-        # 1. Try current frame - Selenium
         try:
             els = driver.find_elements(By.CSS_SELECTOR, "input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']")
             for el in els:
@@ -194,7 +265,6 @@ def find_share_people_input(driver, timeout=20):
         except Exception:
             pass
 
-        # 2. Try current frame - JS with Shadow DOM piercing
         try:
             el = driver.execute_script("""
                 function findInput(root) {
@@ -222,22 +292,18 @@ def find_share_people_input(driver, timeout=20):
         except Exception:
             pass
 
-        # 3. Try iframes - only if we are at the top level
         try:
             is_iframe = driver.execute_script("return window.self !== window.top;")
             if not is_iframe:
                 for frame in driver.find_elements(By.TAG_NAME, "iframe"):
                     try:
                         driver.switch_to.frame(frame)
-                        
-                        # Selenium check
                         els = driver.find_elements(By.CSS_SELECTOR, "input[jsname='YPqjbf'], input[aria-label='Add people, groups, spaces, and calendar events']")
                         for el in els:
                             if el.is_displayed():
                                 print("  [find_share] Found input in iframe (Selenium).")
-                                return el  # Leave driver in iframe
+                                return el
                         
-                        # JS with Shadow DOM piercing inside iframe
                         el = driver.execute_script("""
                             function findInput(root) {
                                 if (!root) return null;
@@ -261,7 +327,7 @@ def find_share_people_input(driver, timeout=20):
                         """)
                         if el:
                             print("  [find_share] Found input in iframe (JS).")
-                            return el  # Leave driver in iframe
+                            return el
                     except Exception:
                         pass
                     
@@ -324,8 +390,6 @@ def _clear_share_input(driver, input_field):
     except Exception:
         pass
 
-
-# -- Insertion Methods --
 
 def _insert_email_atomic(driver, input_field, email):
     try:
@@ -573,13 +637,11 @@ def paste_batch_no_enter(driver, emails):
         driver.execute_script("arguments[0].focus();", input_field)
         bulk_str = ", ".join([str(e).strip() for e in emails if str(e).strip()])
         
-        # Using CDP for instant pasting (fires proper React events)
         driver.execute_cdp_cmd("Input.insertText", {"text": bulk_str})
         time.sleep(0.5)
         
-        # Press Enter to confirm all chips
         ActionChains(driver).send_keys(Keys.ENTER).perform()
-        time.sleep(3) # Wait for Google to process the bulk list
+        time.sleep(3)
 
         val = _input_value(driver, input_field)
         if not val or not val.strip():
@@ -590,7 +652,6 @@ def paste_batch_no_enter(driver, emails):
     except Exception as e:
         print(f"  [fast] Bulk paste failed: {e}")
 
-    # Clean up if bulk failed
     _clear_share_input(driver, input_field)
     time.sleep(0.5)
 
@@ -603,9 +664,8 @@ def paste_batch_no_enter(driver, emails):
             if not email: continue
             try:
                 driver.execute_script("arguments[0].focus();", input_field)
-                # Type and Enter immediately
                 ActionChains(driver).send_keys(email).send_keys(Keys.ENTER).perform()
-                time.sleep(0.15) # Bare minimum wait for chip creation
+                time.sleep(0.15)
                 success_count += 1
             except Exception:
                 break
@@ -872,14 +932,21 @@ def process_email_file_in_batches(driver, input_path, limit):
             print(f"  Batch paste raised exception: {e}")
             continue
 
-        time.sleep(15)
+        print("  Waiting exactly 10 seconds for Google to validate emails...")
+        time.sleep(10)
 
-        # FIXED: Now uses the fixed parsing logic
-        valid_list, error_list = parse_email_lines(batch)
+        # NEW: Extract actual results directly from the Google Drive UI chips
+        valid_list, error_list = get_chips_from_ui(driver)
+        
+        # Fallback if UI extraction completely fails (e.g. dialog closed unexpectedly)
+        if not valid_list and not error_list:
+            print("  [ui-parse] No chips found, falling back to text parsing.")
+            valid_list, error_list = parse_email_lines(batch)
+
         write_unique_lines(VALID_OUTPUT_PATH, valid_list)
         write_unique_lines(ERROR_OUTPUT_PATH, error_list)
         print(f"  Valid emails saved: {len(valid_list)}")
-        print(f"  Error lines saved: {len(error_list)}")
+        print(f"  Error emails saved: {len(error_list)}")
 
         try:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
